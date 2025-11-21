@@ -315,11 +315,11 @@ class MMEBModel(nn.Module):
     #         loss = loss * self.world_size
 
     #     return loss
-    def forward(self, qry=None, tgt=None, neg=None, *args, **kwargs):
+   def forward(self, qry=None, tgt=None, neg=None, *args, **kwargs):
         """
         qry: query inputs (text+image)
         tgt: positive target inputs (text)
-        neg: explicit negative inputs (text)
+        neg: explicit negative inputs (text) -- will only affect softmax denominator
         """
         qry_reps = self.encode_input(qry) if qry else None
         tgt_reps = self.encode_input(tgt) if tgt else None
@@ -338,40 +338,74 @@ class MMEBModel(nn.Module):
             all_tgt_reps = tgt_reps
             all_neg_reps = neg_reps
 
+        batch_size = all_qry_reps.size(0)
+
         # ----------------------
-        # Explicit positive & negative
+        # Positive scores
         # ----------------------
         pos_scores = self.compute_similarity(all_qry_reps, all_tgt_reps)  # (B, 1)
-        if all_neg_reps is not None:
-            neg_scores = self.compute_similarity(all_qry_reps, all_neg_reps)  # (B, N_explicit)
-            scores = torch.cat([pos_scores, neg_scores], dim=1)
-        else:
-            scores = pos_scores
 
         # ----------------------
-        # Implicit negatives (batch negatives)
+        # Implicit in-batch negatives
         # ----------------------
-        # batch 内其他正样本也作为负样本
-        batch_size = all_qry_reps.size(0)
         if batch_size > 1:
-            # (B, B) similarity between queries and all positives
             batch_sim = self.compute_similarity(all_qry_reps, all_tgt_reps)  # (B, B)
-            # 排除自己的正样本 (diagonal)
             mask = torch.eye(batch_size, dtype=torch.bool, device=batch_sim.device)
-            implicit_neg_scores = batch_sim.masked_select(~mask).view(batch_size, batch_size - 1)  # (B, B-1)
-            scores = torch.cat([scores, implicit_neg_scores], dim=1)
+            batch_neg_scores = batch_sim.masked_select(~mask).view(batch_size, batch_size - 1)  # (B, B-1)
+        else:
+            batch_neg_scores = None
 
         # ----------------------
-        # 构建 target (正样本在第0列)
+        # Construct logits for cross-entropy
+        # Only include positive and in-batch negatives in matrix
         # ----------------------
-        target = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
+        if batch_neg_scores is not None:
+            logits = torch.cat([pos_scores, batch_neg_scores], dim=1)  # (B, 1 + B-1)
+        else:
+            logits = pos_scores  # (B, 1)
 
-        # cross entropy loss
-        loss = self.cross_entropy(scores / self.temperature, target)
+        # ----------------------
+        # Extra negatives (prev-batch / nearest predicate / same-pic-diff-bbox)
+        # Only contribute to softmax denominator
+        # ----------------------
+        if all_neg_reps is not None:
+            extra_neg_scores = self.compute_similarity(all_qry_reps, all_neg_reps)  # (B, N_extra)
+            # Add to logits in a numerically safe way using log-sum-exp trick
+            # We'll adjust logits via cross-entropy computation later
+            # For simplicity, we can merge into softmax denominator manually
+            # Here we store them separately for clarity
+        else:
+            extra_neg_scores = None
+
+        # ----------------------
+        # Construct target: positive at column 0
+        # ----------------------
+        target = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
+
+        # ----------------------
+        # Compute cross-entropy loss
+        # ----------------------
+        # If extra negatives exist, add their contributions to softmax denominator
+        if extra_neg_scores is not None:
+            # logits: (B, 1 + B-1)
+            # extra_neg_scores: (B, N_extra)
+            # We'll compute: log_softmax(logits) over in-batch, but denominator includes extra_neg_scores
+            # Implement as manual cross-entropy
+            temperature = self.temperature
+            # Numerically stable log-sum-exp
+            max_val = torch.max(torch.cat([logits, extra_neg_scores], dim=1) / temperature, dim=1, keepdim=True)[0]
+            exp_sum = torch.exp(logits / temperature - max_val)  # (B, 1 + B-1)
+            exp_sum_extra = torch.exp(extra_neg_scores / temperature - max_val)  # (B, N_extra)
+            log_prob = logits[:, 0] / temperature - max_val.squeeze() - torch.log(exp_sum.sum(dim=1) + exp_sum_extra.sum(dim=1) + 1e-8)
+            loss = -log_prob.mean()
+        else:
+            loss = self.cross_entropy(logits / self.temperature, target)
+
         if self.is_ddp:
             loss = loss * self.world_size
 
-        return {"loss": loss, "scores": scores}
+        return {"loss": loss, "scores": logits, "extra_neg_scores": extra_neg_scores}
+
 
 
 
