@@ -222,7 +222,7 @@ class MultimodalDataCollator:
         pos_combined_texts = [f"{q} {p}" for q, p in zip(qry_inputs['text'], pos_texts)]
         pos_inputs_for_processor = {
             'text': pos_combined_texts,
-            'images': qry_inputs['images']  # only query image
+            'images': [None] * len(neg_combined_texts)  # no images for positives
         }
 
         # Negative: combine query text + each negative text, images are None
