@@ -1,25 +1,23 @@
 import os
 import json
 import random
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from dataclasses import dataclass, field
 from transformers import HfArgumentParser, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
 
 from src.arguments import ModelArguments, DataArguments, TrainingArguments
 from src.model.model import MMEBModel
-from src.model.processor import load_processor,QWEN2_VL,VLM_IMAGE_TOKENS
+from src.model.processor import load_processor
 from src.data.collator.train_collator import MultimodalDataCollator
-from typing import Optional
 from PIL import Image
 
-import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
-from torch.utils.data import random_split
+
+import wandb
 
 
 # ------------------------------
@@ -57,11 +55,26 @@ def format_object_with_ref(object_label):
     return f"<|object_ref_start|>{object_label}<|object_ref_end|>"
 
 
+# image token placeholder
+VLM_IMAGE_TOKENS = {"QWEN2_VL": "<|image_pad|>"}  # 注意这里必须是 <|image_pad|>
+QWEN2_VL = "QWEN2_VL"
+
+
+
 # ------------------------------
 # Dataset
 # ------------------------------
 class SGGContrastiveDataset(Dataset):
-    def __init__(self, json_path: str, image_dir: str, relation_vocabulary: List[str] = None, num_negatives: int = 5):
+    def __init__(
+        self, 
+        json_path: str, 
+        image_dir: str, 
+        relation_vocabulary: Optional[List[str]] = None, 
+        num_negatives: int = 12,
+        topk_nearest: Optional[dict] = None,
+        topk_nearest_file: Optional[str] = None
+    ):
+        # 读取样本
         with open(json_path, 'r') as f:
             content = f.read().strip()
             if content.startswith('['):
@@ -72,6 +85,7 @@ class SGGContrastiveDataset(Dataset):
         self.image_dir = image_dir
         self.num_negatives = num_negatives
 
+        # 构建 predicate vocab
         if relation_vocabulary is None:
             rels = set()
             for s in self.samples:
@@ -84,6 +98,16 @@ class SGGContrastiveDataset(Dataset):
         if len(self.vocab) == 0:
             raise ValueError("Empty relation vocabulary")
 
+        # 处理 top-k nearest
+        if topk_nearest is not None:
+            self.topk_nearest = topk_nearest
+        elif topk_nearest_file is not None:
+            with open(topk_nearest_file, 'r') as f:
+                data = json.load(f)
+                self.topk_nearest = {k: v["neighbors"] for k, v in data.items()}
+        else:
+            self.topk_nearest = {}
+
     def __len__(self):
         return len(self.samples)
 
@@ -95,13 +119,12 @@ class SGGContrastiveDataset(Dataset):
         return {'resolutions': [None], 'paths': [full], 'bytes': [None]}
 
     def _get_image_dimensions(self, image_path: str):
-        """获取图像尺寸"""
         try:
             with Image.open(image_path) as img:
-                return img.size  # (width, height)
+                return img.size
         except Exception as e:
             print(f"Warning: Failed to get image dimensions for {image_path}: {e}")
-            return (1024, 1024)  # 默认尺寸
+            return (1024, 1024)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
@@ -113,36 +136,37 @@ class SGGContrastiveDataset(Dataset):
         bbox2 = obj.get('bbox') or s.get('bbox2')
         subj_name = subj.get('class_name', 'objectA')
         obj_name = obj.get('class_name', 'objectB')
-        
-        # 获取完整图像路径和尺寸
+
+        # 图像信息
         full_image_path = self._full_image_path(image_path)
         original_width, original_height = self._get_image_dimensions(full_image_path)
-        
-        # 使用特殊token格式化subject和object
-        subj_bbox_token = format_bbox_as_special_token(
-            bbox1, True, original_width, original_height
-        )
-        obj_bbox_token = format_bbox_as_special_token(
-            bbox2, True, original_width, original_height
-        )
+
+        # 格式化 token
+        subj_bbox_token = format_bbox_as_special_token(bbox1, True, original_width, original_height)
+        obj_bbox_token = format_bbox_as_special_token(bbox2, True, original_width, original_height)
         subj_ref = format_object_with_ref(subj_name)
         obj_ref = format_object_with_ref(obj_name)
-        
-        # 构建query文本（对齐inference代码）
-        query_text = f"{VLM_IMAGE_TOKENS[QWEN2_VL]} In the given image, the subject {subj_ref} is located at {subj_bbox_token}, the object {obj_ref} is located at {obj_bbox_token}. Please return the predicate relationship between the subject and the object."
 
-        # Use full-sentence text for positive and negative targets
+        query_text = f"{VLM_IMAGE_TOKENS[QWEN2_VL]} In the given image, the subject {subj_ref} is located at {subj_bbox_token}, the object {obj_ref} is located at {obj_bbox_token}. Please return the predicate relationship between the subject and the object."
         pos_text = f"The subject is {predicate} the object."
 
-         # 生成负样本文本（唯一化）
+        # 负样本生成（hard nearest + random）
         neg_candidates = [r for r in self.vocab if r != predicate]
-        if neg_candidates:
-            negs_raw = random.sample(neg_candidates, min(self.num_negatives, len(neg_candidates)))
-        else:
-            negs_raw = [predicate] * self.num_negatives
-        neg_texts = [f"The subject is {r} the object." for r in negs_raw]
 
-        # 生成 image field（只生成一次，复用）
+        hard_negatives = []
+        if self.topk_nearest:
+            hard_negatives = [r for r in self.topk_nearest.get(predicate, []) if r != predicate]
+
+        remaining = max(self.num_negatives - len(hard_negatives), 0)
+        if neg_candidates:
+            random_negatives = random.sample(neg_candidates, min(remaining, len(neg_candidates)))
+        else:
+            random_negatives = []
+
+        final_negatives = hard_negatives + random_negatives
+        neg_texts = [f"The subject is {r} the object." for r in final_negatives]
+
+        # image field
         img_field = self._make_image_field(image_path)
         query_image = img_field
         pos_image = img_field
@@ -159,6 +183,7 @@ class SGGContrastiveDataset(Dataset):
         }
 
 
+
 # ------------------------------
 # Utils
 # ------------------------------
@@ -171,62 +196,6 @@ def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, An
         return batch.to(device)
     else:
         return batch
-
-
-def plot_loss_curve(loss_history: Dict[str, List[float]], save_path: str):
-    """绘制训练 loss 曲线"""
-    plt.figure(figsize=(14, 6))
-    
-    # Plot step-wise loss
-    plt.subplot(1, 2, 1)
-    plt.plot(loss_history['steps'], loss_history['losses'], alpha=0.6, label='Train Loss')
-    if len(loss_history['losses']) > 100:
-        # 平滑曲线
-        window = min(100, len(loss_history['losses']) // 10)
-        smoothed = np.convolve(loss_history['losses'], np.ones(window)/window, mode='valid')
-        plt.plot(range(window//2, len(smoothed) + window//2), smoothed, 
-                linewidth=2, label=f'Smoothed (window={window})')
-    # Plot eval losses recorded at eval steps (if any)
-    if 'eval_steps' in loss_history and loss_history.get('eval_steps'):
-        plt.scatter(loss_history['eval_steps'], loss_history.get('eval_losses_steps', []),
-                    color='red', marker='x', s=40, label='Eval Loss (step)')
-
-    plt.xlabel('Step')
-    plt.ylabel('Loss')
-    plt.title('Training Loss (Step-wise)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # Plot epoch-wise average loss
-    plt.subplot(1, 2, 2)
-    if loss_history['epoch_losses']:
-        epochs = range(1, len(loss_history['epoch_losses']) + 1)
-        plt.plot(epochs, loss_history['epoch_losses'], marker='o', linewidth=2, markersize=8, label='Train Loss')
-        
-        # Plot eval loss if available
-        if 'eval_losses' in loss_history and loss_history['eval_losses']:
-            eval_epochs = range(1, len(loss_history['eval_losses']) + 1)
-            plt.plot(eval_epochs, loss_history['eval_losses'], marker='s', linewidth=2, markersize=8, label='Eval Loss')
-        
-        plt.xlabel('Epoch')
-        plt.ylabel('Average Loss')
-        plt.title('Loss (Epoch-wise)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        # 标注最小 loss
-        min_loss_epoch = np.argmin(loss_history['epoch_losses']) + 1
-        min_loss = loss_history['epoch_losses'][min_loss_epoch - 1]
-        plt.annotate(f'Min: {min_loss:.4f}', 
-                    xy=(min_loss_epoch, min_loss),
-                    xytext=(10, 10), textcoords='offset points',
-                    bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.7),
-                    arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"📊 Loss curve saved to: {save_path}")
 
 
 def evaluate(model, val_loader, device, return_scores=False):
@@ -261,13 +230,6 @@ def evaluate(model, val_loader, device, return_scores=False):
 
 
 
-def save_loss_json(loss_history: Dict[str, List[float]], save_path: str):
-    """保存 loss 数据为 JSON"""
-    with open(save_path, 'w') as f:
-        json.dump(loss_history, f, indent=2)
-    print(f"💾 Loss data saved to: {save_path}")
-
-
 # ------------------------------
 # Train Loop
 # ------------------------------
@@ -294,17 +256,27 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
         )
         model.encoder = get_peft_model(model.encoder, lora_config)
         print("✅ LoRA applied")
-        
-        # 打印可训练参数
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in model.parameters())
         print(f"📊 Trainable params: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
 
+        
+    # -----------------------------
+    # Initialize W&B
+    # -----------------------------
+    wandb.init(
+        project="sgg_qwen2vl",
+        name=os.path.basename(training_args.output_dir.rstrip("/")),
+        config={**vars(model_args), **vars(data_args), **vars(training_args)},
+        mode="offline"  # <-- 离线模式
+    )
+
     # 准备数据
     dataset = SGGContrastiveDataset(
-        data_args.dataset_json, 
-        data_args.image_dir, 
-        num_negatives=data_args.num_negatives
+        json_path=data_args.dataset_json,             # JSON 数据集路径
+        image_dir=data_args.image_dir,               # 图像目录
+        num_negatives=data_args.num_negatives,       # 每个样本负样本总数
+        topk_nearest_file=getattr(data_args, 'topk_nearest_file', None)  # 可选 topk nearest JSON 文件
     )
     collator = MultimodalDataCollator(
         processor=processor,
@@ -325,6 +297,7 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
 
     # ---------- evaluation dataset/loader (optional) ----------
     # Use the eval path supplied in DataArguments. The default should be set in `src/arguments.py`.
+    val_loader = None
     eval_json = getattr(data_args, 'eval_dataset_json', None)
     if eval_json:
         try:
@@ -346,9 +319,6 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
         except Exception as e:
             val_loader = None
             print(f"⚠️  Failed to load eval dataset from {eval_json}: {e}")
-    else:
-        val_loader = None
-        print("ℹ️  No eval_dataset_json provided in DataArguments; skipping evaluation during training.")
 
     # 优化器和学习率调度器
     optimizer = torch.optim.AdamW(
@@ -369,17 +339,7 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
         num_training_steps=total_steps
     )
 
-    print(f"\n🚀 Training Info:")
-    print(f"  Dataset size: {len(dataset)}")
-    print(f"  Batch size: {training_args.per_device_train_batch_size}")
-    print(f"  Gradient accumulation steps: {training_args.gradient_accumulation_steps}")
-    print(f"  Effective batch size: {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps}")
-    print(f"  Num epochs: {training_args.num_train_epochs}")
-    print(f"  Total steps: {total_steps}")
-    print(f"  Warmup steps: {warmup_steps}")
-    print(f"  Learning rate: {training_args.learning_rate}")
-    print()
-
+    global_step = 0
     # Loss 记录
     loss_history = {
         'steps': [],
@@ -389,22 +349,14 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
         'eval_losses_steps': [],  # eval loss at each eval step
         'eval_steps': []  # step indices for eval loss
     }
-
-    global_step = 0
     best_loss = float('inf')
     best_eval_loss = float('inf')
 
     # 训练循环
     for epoch in range(int(training_args.num_train_epochs)):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch+1}/{int(training_args.num_train_epochs)}")
-        print(f"{'='*60}")
-        
+        model.train()
         epoch_losses = []
         optimizer.zero_grad()
-        
-        # 使用 tqdm 显示进度条
-        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}")
         
         for batch_idx, (qry_inputs, pos_inputs, neg_inputs) in enumerate(dataloader):
             qry_inputs = batch_to_device(qry_inputs, device)
@@ -430,20 +382,17 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
                 scheduler.step()
                 optimizer.zero_grad()
 
-                # 记录到 loss history
-                loss_history['steps'].append(global_step)
-                loss_history['losses'].append(loss_tensor.item() * training_args.gradient_accumulation_steps)
-
-                # 更新进度条
-                pbar.set_postfix({
-                    'loss': f"{loss_tensor.item() * training_args.gradient_accumulation_steps:.4f}",
-                    'lr': f"{scheduler.get_last_lr()[0]:.2e}"
-                })
-
-                # 定期打印
-                if global_step % training_args.logging_steps == 0:
-                    avg_loss = np.mean(epoch_losses[-training_args.logging_steps:])
-                    print(f"\n[Step {global_step}] loss: {loss_tensor.item() * training_args.gradient_accumulation_steps:.6f} | avg_loss: {avg_loss:.6f} | lr: {scheduler.get_last_lr()[0]:.2e}")
+                # Log to W&B
+                current_lr = scheduler.get_last_lr()[0]
+                step_loss = loss_tensor.item() * training_args.gradient_accumulation_steps
+                wandb.log({
+                    "train/loss_step": step_loss,
+                    "lr": current_lr,
+                    "epoch": epoch+1,
+                    "global_step": global_step
+                }, step=global_step)
+                if global_step % 100 == 0:
+                    print(f"[Step {global_step}] Epoch {epoch+1} | Loss: {step_loss:.4f} | LR: {current_lr:.2e}")
 
                 global_step += 1
 
@@ -451,10 +400,8 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
                 if hasattr(training_args, 'eval_steps') and getattr(training_args, 'eval_steps') and val_loader is not None:
                     if global_step % int(training_args.eval_steps) == 0:
                         val_loss = evaluate(model, val_loader, device)
-                        print(f"\n[Eval at step {global_step}] val_loss: {val_loss:.6f}")
-                        # Track eval loss at this step
-                        loss_history['eval_losses_steps'].append(val_loss)
-                        loss_history['eval_steps'].append(global_step)
+                        wandb.log({"eval/loss": val_loss, "step": global_step})
+                        print(f"[Eval Step {global_step}] Validation Loss: {val_loss:.4f}")
 
                         # 根据 eval loss 保存最佳模型（可选）
                         if val_loss < best_eval_loss:
@@ -462,17 +409,18 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
                             best_dir_eval = os.path.join(training_args.output_dir, "best_model_eval")
                             os.makedirs(best_dir_eval, exist_ok=True)
                             model.save(best_dir_eval)
-                            print(f"🏆 New best eval model saved (val_loss: {best_eval_loss:.6f}) to: {best_dir_eval}")
-
+                            print(f"🏆 New best eval model saved at step {global_step} (val_loss: {best_eval_loss:.4f})")
+                           
         # Epoch 结束
         avg_epoch_loss = np.mean(epoch_losses)
-        loss_history['epoch_losses'].append(avg_epoch_loss)
+        wandb.log({"train/epoch_loss": avg_epoch_loss, "epoch": epoch+1})
+        print(f"📊 Epoch {epoch+1} Avg Loss: {avg_epoch_loss:.4f} [W&B logged]\n")
 
         # Evaluate at the end of each epoch and track eval loss
         if val_loader is not None:
             val_loss_epoch = evaluate(model, val_loader, device)
-            loss_history['eval_losses'].append(val_loss_epoch)
-            print(f"\n[Eval at epoch {epoch+1}] val_loss: {val_loss_epoch:.6f}")
+            wandb.log({"eval/epoch_loss": val_loss_epoch, "epoch": epoch+1})
+            print(f"📊 Epoch {epoch+1} Validation Loss: {val_loss_epoch:.4f} [W&B logged]")
         
         print(f"\n📊 Epoch {epoch+1} Summary:")
         print(f"  Average Loss: {avg_epoch_loss:.6f}")
@@ -489,27 +437,23 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
         # 保存最佳模型
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
+            wandb.run.summary["best_train_loss"] = best_loss
             best_dir = os.path.join(training_args.output_dir, "best_model")
             os.makedirs(best_dir, exist_ok=True)
             model.save(best_dir)
-            print(f"🏆 Best model saved (loss: {best_loss:.6f}) to: {best_dir}")
+            print(f"🏆 Best model saved — loss: {best_loss:.6f} — {best_dir}")
 
     # 最终保存
     final_dir = os.path.join(training_args.output_dir, "final")
     os.makedirs(final_dir, exist_ok=True)
     model.save(final_dir)
-    
-    # 最终的 loss 图和数据
-    plot_loss_curve(loss_history, os.path.join(training_args.output_dir, "final_loss_curve.png"))
-    save_loss_json(loss_history, os.path.join(training_args.output_dir, "final_loss_history.json"))
-    
+    wandb.finish()
+
     print(f"\n{'='*60}")
     print("✅ Training Complete!")
     print(f"{'='*60}")
     print(f"📁 Final model saved to: {final_dir}")
     print(f"🏆 Best model saved to: {os.path.join(training_args.output_dir, 'best_model')}")
-    print(f"📊 Loss curve: {os.path.join(training_args.output_dir, 'final_loss_curve.png')}")
-    print(f"💾 Loss data: {os.path.join(training_args.output_dir, 'final_loss_history.json')}")
     print(f"🎯 Best loss: {best_loss:.6f}")
 
 

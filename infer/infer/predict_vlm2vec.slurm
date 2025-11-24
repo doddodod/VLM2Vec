@@ -20,7 +20,7 @@
 set -e
 source ~/.bashrc 
 
-echo "model /inspurfs/group/hexm/ov_sgg/train_model_param/train_5k_ratio"
+echo "model /inspurfs/group/hexm/ov_sgg/train_model_param/vlm2vec_qwen2vl"
 
 echo "🔧 激活conda环境..."
 source /public/home/xiaojw2025/anaconda3/etc/profile.d/conda.sh

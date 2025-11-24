@@ -1089,8 +1089,8 @@ def main():
   python evaluate_results.py results.json --calculate-mr --multi-k --predicate-multi-k --category-recall --export report.json
         """
     )
-    
-    parser.add_argument('--json_file', type=str, default='/public/home/xiaojw2025/Workspace/VLM2Vec/predict/recall_results_2000_qwen2vl_2b_instruct.json', help='预测结果JSON文件路径')
+    #/public/home/xiaojw2025/Data/embedding_similarity/vlm2vec_qwen2vl/result_recall_2000.json
+    parser.add_argument('--json_file', type=str, default='/public/home/xiaojw2025/Data/embedding_similarity/vlm2vec_qwen2vl/result_recall_20_all.json', help='预测结果JSON文件路径')
     parser.add_argument('--calculate-mr', action='store_true', 
                        help='计算Mean Rank (MR) 指标（需要完整候选列表）')
     parser.add_argument('--multi-k', action='store_true',

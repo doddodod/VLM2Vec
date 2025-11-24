@@ -206,7 +206,7 @@ class MultimodalDataCollator:
 
     #     # print_rank(f"\t\tQry collator: processed_qry_inputs['input_ids'].shape={processed_qry_inputs['input_ids'].shape}\t\tPos collator: processed_pos_inputs['input_ids'].shape={processed_pos_inputs['input_ids'].shape}")
     #     return processed_qry_inputs, processed_pos_inputs
-  def __call__(self, examples):
+    def __call__(self, examples):
         """
         Collator for VLM2Vec + contrastive SGG training.
 

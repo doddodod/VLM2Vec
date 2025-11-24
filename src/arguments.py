@@ -52,6 +52,7 @@ class DataArguments:
     resize_max_pixels: int = field(default=28*28*1280, metadata={"help": "The max pixels of the image to resize the image. This is only works when `--resize_use_processor true`."})
     image_decay_factor: float = field(default=None, metadata={"help": "The image decay factor for resizing temporal images"})
     num_hardneg: int = field(default=0, metadata={"help": "hard negative number"})
+    topk_nearest_file: str = field(default=None, metadata={"help": "nearest predicate JSON 文件路径，可选"})
 
 
 @dataclass

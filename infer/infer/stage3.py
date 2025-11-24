@@ -1,4 +1,3 @@
- 
 import json
 import torch
 from PIL import Image
@@ -92,8 +91,10 @@ from src.arguments import ModelArguments, DataArguments
 from src.model.processor import load_processor, QWEN2_VL, VLM_IMAGE_TOKENS
 
 
+# Stage2输出文件（包含CoT数据）
+STAGE2_OUTPUT_FILE = "/public/home/xiaojw2025/Data/stage2/stage2_generated_results.json"
 INPUT_FILE = "/public/home/xiaojw2025/Workspace/RAHP/DATASET/VG150/test_2000_images.json"
-OUTPUT_FILE = "/public/home/xiaojw2025/Workspace/VLM2Vec/predict/recall_results_2000_train_5k_ratio.json"
+OUTPUT_FILE = "/public/home/xiaojw2025/Data/stage3/recall_results_2000_stage3.json"
 
 # 默认使用的GPU数量（None表示使用所有可用GPU）
 # 也可以通过命令行参数 --num_gpus 或环境变量 NUM_GPUS 指定
@@ -108,7 +109,7 @@ PREDICATES = [
     "mounted on", "near", "of", "on", "on back of", "over", "painted on",
     "parked on", "part of", "playing", "riding", "says", "sitting on",
     "standing on", "to", "under", "using", "walking in", "walking on",
-    "watching", "wearing", "wears", "with","no relation"
+    "watching", "wearing", "wears", "with"
 ]
 
 
@@ -143,7 +144,62 @@ def format_object_with_ref(object_label):
     return f"<|object_ref_start|>{object_label}<|object_ref_end|>"
 
 
-def precompute_predicate_vectors(model, processor, predicates, device='cuda'):
+def load_stage2_cot_data(stage2_file):
+    """
+    加载stage2的输出文件，建立(image_id, subject_id, object_id) -> CoT描述的映射
+    同时支持使用类别名的向后兼容格式
+    
+    Returns:
+        dict: {(image_id, subject_id, object_id): cot_description} 或 {(image_id, subject, object): cot_description}
+    """
+    print(f"📖 正在加载Stage2 CoT数据: {stage2_file}")
+    with open(stage2_file, 'r', encoding='utf-8') as f:
+        stage2_data = json.load(f)
+    
+    cot_map = {}
+    results = stage2_data.get('results', [])
+    
+    for result in results:
+        image_id = result['image_id']
+        subject_id = result.get('subject_id', None)
+        object_id = result.get('object_id', None)
+        subject = result['subject'].strip()  # 去除可能的空格
+        object_name = result['object'].strip()  # 去除可能的空格
+        cot_description = result.get('stage2_generated_description', '')
+        
+        # 优先使用物体ID创建key（区分同名物体）
+        if subject_id is not None and object_id is not None:
+            # 使用物体ID作为key
+            key_formats = [
+                (str(image_id), subject_id, object_id),  # 字符串image_id
+                (image_id, subject_id, object_id),  # 原始image_id格式
+            ]
+            # 如果image_id是字符串且可转换为整数，也添加整数key
+            if isinstance(image_id, str) and image_id.isdigit():
+                key_formats.append((int(image_id), subject_id, object_id))
+            # 如果image_id是整数，也添加字符串key（上面已添加）
+            
+            for key_format in key_formats:
+                cot_map[key_format] = cot_description
+        else:
+            # 向后兼容：使用类别名作为key
+            key_formats = [
+                (str(image_id), subject, object_name),  # 字符串image_id
+                (image_id, subject, object_name),  # 原始image_id格式
+            ]
+            if isinstance(image_id, str) and image_id.isdigit():
+                key_formats.append((int(image_id), subject, object_name))
+            
+            for key_format in key_formats:
+                cot_map[key_format] = cot_description
+    
+    unique_entries = len(results)
+    total_keys = len(cot_map)
+    print(f"   ✓ 加载了 {unique_entries} 个CoT描述（共 {total_keys} 个key格式）")
+    return cot_map
+
+
+def precompute_predicate_vectors(model, processor, predicates, device='cuda', progress_queue=None, gpu_id=None):
     """
     预计算所有谓词的向量表示（只需要计算一次）
     
@@ -152,14 +208,19 @@ def precompute_predicate_vectors(model, processor, predicates, device='cuda'):
         processor: 文本处理器
         predicates: 谓词列表
         device: 设备名称，如 'cuda:0'
+        progress_queue: 进度队列（可选，用于多进程环境）
+        gpu_id: GPU ID（可选，用于多进程环境）
     
     Returns:
         predicate_vectors: [num_predicates, hidden_dim] 的tensor
     """
-    print(f"🔧 预计算谓词向量 (设备: {device})...")
+    if progress_queue is not None and gpu_id is not None:
+        progress_queue.put((gpu_id, f"GPU{gpu_id}: 开始预计算谓词向量..."))
+    
     predicate_vectors = []
     
-    for predicate in tqdm(predicates, desc=f"编码谓词 [{device}]"):
+    # 在多进程环境下，不使用tqdm（输出会被缓冲），改用简单打印
+    for idx, predicate in enumerate(predicates):
         predicate_text = f"The subject is {predicate} the object."
         inputs = processor(text=predicate_text, images=None, return_tensors="pt")
         inputs = {key: value.to(device) for key, value in inputs.items()}
@@ -167,47 +228,144 @@ def precompute_predicate_vectors(model, processor, predicates, device='cuda'):
         with torch.no_grad():
             tgt_output = model(tgt=inputs)["tgt_reps"]
             predicate_vectors.append(tgt_output)
+        
+        # 每10个谓词更新一次进度
+        if (idx + 1) % 10 == 0 and progress_queue is not None and gpu_id is not None:
+            progress_queue.put((gpu_id, f"GPU{gpu_id}: 预计算谓词向量进度: {idx + 1}/{len(predicates)}"))
     
     # 堆叠成一个tensor: [num_predicates, hidden_dim]
     predicate_vectors = torch.cat(predicate_vectors, dim=0)
-    print(f"✅ 谓词向量预计算完成，shape: {predicate_vectors.shape}")
+    
+    if progress_queue is not None and gpu_id is not None:
+        progress_queue.put((gpu_id, f"GPU{gpu_id}: 谓词向量预计算完成，shape: {predicate_vectors.shape}"))
     
     return predicate_vectors
 
 
+# 全局标志，用于跟踪是否是第一次推理
+_first_inference_printed = False
+
 def predict_relation(model, processor, image_path, subject_obj, object_obj, 
-                     original_width, original_height, predicate_vectors=None, device='cuda'):
+                     original_width, original_height, cot_description, predicate_vectors=None, device='cuda',
+                     use_original_query=False, use_image=False):
     """
-    预测关系，使用预计算的谓词向量
+    预测关系，使用stage2的CoT描述代替原始query
     
     Args:
+        model: VLM2Vec模型
+        processor: 文本处理器
+        image_path: 图片路径
+        subject_obj: 主体对象信息
+        object_obj: 客体对象信息
+        original_width: 图片宽度
+        original_height: 图片高度
+        cot_description: stage2生成的CoT描述文本
         predicate_vectors: 预计算的谓词向量 [num_predicates, hidden_dim]，如果为None则实时计算
         device: 设备名称，如 'cuda:0'
+        use_original_query: 是否在cot_description前加上原始query
+        use_image: 是否调用图像
     """
-    # 构建subject和object的特殊token
-    subj_bbox_token = format_bbox_as_special_token(
-        subject_obj['bbox'], True, original_width, original_height
-    )
-    obj_bbox_token = format_bbox_as_special_token(
-        object_obj['bbox'], True, original_width, original_height
-    )
-    subj_ref = format_object_with_ref(subject_obj['class_name'])
-    obj_ref = format_object_with_ref(object_obj['class_name'])
+    global _first_inference_printed
     
-    query_text = f"{VLM_IMAGE_TOKENS[QWEN2_VL]} In the given image, the subject {subj_ref} is located at {subj_bbox_token},the object{obj_ref} is located at {obj_bbox_token}.Please describe the predicate relationship between the subject and the object but if there is no relation return 'no relation'."
+    # 只使用CoT描述，如果为空则返回None（跳过该样本）
+    if not cot_description or not cot_description.strip():
+        return None
+    
+    # 构建查询文本
+    query_text = cot_description.strip()
+    
+    # 如果需要添加原始query
+    if use_original_query:
+        # 构建原始query
+        subj_ref = format_object_with_ref(subject_obj['class_name'])
+        obj_ref = format_object_with_ref(object_obj['class_name'])
+        subj_bbox_token = format_bbox_as_special_token(
+            subject_obj['bbox'], 
+            normalize=True, 
+            original_width=original_width, 
+            original_height=original_height
+        )
+        obj_bbox_token = format_bbox_as_special_token(
+            object_obj['bbox'], 
+            normalize=True, 
+            original_width=original_width, 
+            original_height=original_height
+        )
+        # 构建坐标信息前缀（与predict_scene_graph_recall_stage3.py保持一致）
+        coordinate_prefix = f"In the given image, the subject {subj_ref} is located at {subj_bbox_token},the object{obj_ref} is located at {obj_bbox_token}. Please describe the predicate relationship between the subject and the object as the subject is *predicate* the object.Besides,"
+        
+        # 如果使用图像，添加图像token（图像token在最前面）
+        image_token = ""
+        if use_image:
+            image_token = VLM_IMAGE_TOKENS[QWEN2_VL]
+            if image_token:
+                image_token = f"{image_token} "
+        
+        # 拼接：图像token + 坐标信息 + CoT描述（直接拼接，不使用换行符）
+        query_text = f"{image_token}{coordinate_prefix}{query_text}"
+    
+    # 决定是否加载图像
+    image = None
+    if use_image:
+        # 如果使用图像，但文本中没有图像token（且use_original_query=False），需要添加图像token
+        if not use_original_query:
+            image_token = VLM_IMAGE_TOKENS[QWEN2_VL]
+            if image_token and image_token not in query_text:
+                query_text = f"{image_token} {query_text}"
+        
+        try:
+            image = Image.open(image_path).convert('RGB')
+        except Exception as e:
+            print(f"⚠️  警告: 无法加载图像 {image_path}: {str(e)}")
+            image = None
     
     inputs = processor(
         text=query_text,
-        images=Image.open(image_path),
+        images=image,  # 根据开关决定是否传入图片
         return_tensors="pt"
     )
     inputs = {key: value.to(device) for key, value in inputs.items()}
-    inputs['pixel_values'] = inputs['pixel_values'].unsqueeze(0)
-    inputs['image_grid_thw'] = inputs['image_grid_thw'].unsqueeze(0)
+    
+    # 验证输入序列长度是否大于0
+    if 'input_ids' in inputs:
+        seq_len = inputs['input_ids'].shape[-1]
+        if seq_len == 0:
+            # 如果序列长度为0，也跳过该样本
+            return None
+    
+    # 如果没有图片，这些字段可能不存在，需要检查
+    if 'pixel_values' in inputs:
+        inputs['pixel_values'] = inputs['pixel_values'].unsqueeze(0)
+    if 'image_grid_thw' in inputs:
+        inputs['image_grid_thw'] = inputs['image_grid_thw'].unsqueeze(0)
     
     try:
         with torch.no_grad():
             qry_output = model(qry=inputs)["qry_reps"]
+            
+            # 打印第一条推理的输入和中间输出
+            if not _first_inference_printed:
+                print("\n" + "="*80)
+                print("第一条推理的输入和输出")
+                print("="*80)
+                print(f"\n【输入信息】")
+                print(f"  image_path: {image_path}")
+                print(f"  subject: {subject_obj['class_name']} (bbox: {subject_obj['bbox']})")
+                print(f"  object: {object_obj['class_name']} (bbox: {object_obj['bbox']})")
+                print(f"  image_size: {original_width}x{original_height}")
+                print(f"\n【CoT描述文本】")
+                print(f"  {query_text[:500]}..." if len(query_text) > 500 else f"  {query_text}")
+                print(f"\n【输入tensor信息】")
+                for key, value in inputs.items():
+                    if isinstance(value, torch.Tensor):
+                        print(f"  {key}: shape={value.shape}, dtype={value.dtype}")
+                    else:
+                        print(f"  {key}: {value}")
+                print(f"\n【中间输出（qry_output）】")
+                print(f"  qry_output shape: {qry_output.shape}")
+                print(f"  qry_output dtype: {qry_output.dtype}")
+                print(f"  qry_output sample (first 10 values): {qry_output[0, :10].cpu().tolist()}")
+                print("="*80 + "\n")
     except RuntimeError as e:
         # 捕获Flash Attention运行时错误
         if "FlashAttention only supports Ampere" in str(e):
@@ -250,6 +408,17 @@ def predict_relation(model, processor, image_path, subject_obj, object_obj,
                 'predicate': predicate,
                 'similarity': similarity.item()
             })
+    
+    # 打印第一条推理的最终输出（predicate_scores）
+    if not _first_inference_printed:
+        print("\n" + "="*80)
+        print("第一条推理的最终输出（Top-10谓词）")
+        print("="*80)
+        sorted_scores = sorted(predicate_scores, key=lambda x: x['similarity'], reverse=True)
+        for i, score in enumerate(sorted_scores[:10], 1):
+            print(f"  {i:2d}. {score['predicate']:20s}: {score['similarity']:.6f}")
+        print("="*80 + "\n")
+        _first_inference_printed = True  # 设置标志，避免后续重复打印
     
     return predicate_scores
 
@@ -442,7 +611,7 @@ def calculate_average_recall_at_k(per_image_candidates, k=50):
     }
 
 
-def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vectors_dict, result_queue, progress_queue):
+def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vectors_dict, cot_map, result_queue, progress_queue, use_original_query=False, use_image=False):
     """
     在指定GPU上处理数据分片
     
@@ -452,8 +621,11 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
         model_args: 模型参数
         data_args: 数据参数
         predicate_vectors_dict: 共享的谓词向量字典（通过Manager创建）
+        cot_map: CoT描述映射字典 {(image_id, subject, object): cot_description}
         result_queue: 结果队列
         progress_queue: 进度队列
+        use_original_query: 是否在cot_description前加上原始query
+        use_image: 是否调用图像
     """
     device = f'cuda:{gpu_id}'
     torch.cuda.set_device(gpu_id)
@@ -464,7 +636,7 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
         
         # 尝试加载模型
         try:
-            model = MMEBModel.load(model_args)
+            model = MMEBModel.load(model_args, is_trainable=False)
             model = model.to(device, dtype=torch.bfloat16)
             model.eval()
         except Exception as e:
@@ -482,7 +654,7 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
                 from src.model.model import MMEBModel as MMEBModelReloaded
                 
                 processor = load_processor(model_args, data_args)
-                model = MMEBModelReloaded.load(model_args)
+                model = MMEBModelReloaded.load(model_args, is_trainable=False)
                 model = model.to(device, dtype=torch.bfloat16)
                 model.eval()
             else:
@@ -491,16 +663,27 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
         # 获取或预计算谓词向量
         if gpu_id not in predicate_vectors_dict:
             # 如果该GPU还没有谓词向量，则预计算
-            predicate_vectors = precompute_predicate_vectors(model, processor, PREDICATES, device=device)
+            predicate_vectors = precompute_predicate_vectors(
+                model, processor, PREDICATES, device=device,
+                progress_queue=progress_queue, gpu_id=gpu_id
+            )
             predicate_vectors_dict[gpu_id] = predicate_vectors.cpu()  # 保存到CPU以便共享
         else:
             # 使用共享的谓词向量（需要移回GPU）
             predicate_vectors = predicate_vectors_dict[gpu_id].to(device)
+            progress_queue.put((gpu_id, f"GPU{gpu_id}: 使用共享谓词向量，开始处理图片..."))
         
         # 处理该GPU的数据分片
         per_image_candidates = {}
         all_relations_info = []
         processed_images = 0
+        total_images = len(data_shard)
+        missing_cot_count = 0
+        total_pairs_checked = 0  # 统计检查的配对总数
+        
+        # 发送开始处理的消息
+        progress_queue.put((gpu_id, f"GPU{gpu_id}: 开始处理 {total_images} 张图片"))
+        
         for img_idx, img_data in enumerate(data_shard):
             image_id = img_data['image_id']
             image_path = img_data['image_path']
@@ -543,14 +726,57 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
                     subject_obj = obj_dict[subject_id]
                     object_obj = obj_dict[object_id]
                     
-                    # 预测关系
+                    # 查找对应的CoT描述（优先使用物体ID）
+                    subject_name = subject_obj['class_name'].strip()  # 去除可能的空格
+                    object_name = object_obj['class_name'].strip()  # 去除可能的空格
+                    total_pairs_checked += 1
+                    
+                    # 尝试多种key格式以确保匹配（优先使用物体ID）
+                    cot_description = None
+                    key_formats = []
+                    
+                    # 优先尝试使用物体ID的key格式
+                    key_formats.extend([
+                        (str(image_id), subject_id, object_id),  # 字符串image_id + 物体ID
+                        (image_id, subject_id, object_id),  # 原始image_id格式 + 物体ID
+                    ])
+                    if isinstance(image_id, str) and image_id.isdigit():
+                        key_formats.append((int(image_id), subject_id, object_id))
+                    
+                    # 向后兼容：如果没有找到，尝试使用类别名的key格式
+                    key_formats.extend([
+                        (str(image_id), subject_name, object_name),  # 字符串image_id + 类别名
+                        (image_id, subject_name, object_name),  # 原始image_id格式 + 类别名
+                    ])
+                    if isinstance(image_id, str) and image_id.isdigit():
+                        key_formats.append((int(image_id), subject_name, object_name))
+                    
+                    for key_format in key_formats:
+                        if key_format and key_format in cot_map:
+                            cot_description = cot_map[key_format]
+                            break
+                    
+                    # 如果没有找到CoT描述，统计并跳过该样本
+                    if not cot_description or not cot_description.strip():
+                        missing_cot_count += 1
+                        continue  # 跳过该配对
+                    
+                    # 预测关系（使用CoT描述）
                     predicate_scores = predict_relation(
                         model, processor, image_path,
                         subject_obj, object_obj,
                         original_width, original_height,
+                        cot_description=cot_description,
                         predicate_vectors=predicate_vectors,
-                        device=device
+                        device=device,
+                        use_original_query=use_original_query,
+                        use_image=use_image
                     )
+                    
+                    # 如果predict_relation返回None（CoT描述为空或处理失败），跳过该样本
+                    if predicate_scores is None:
+                        missing_cot_count += 1
+                        continue
                     
                     # 判断该配对是否有GT关系
                     has_gt = (subject_id, object_id) in gt_relations_map
@@ -563,6 +789,8 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
                                 'relation_idx': -1,  # 将在主进程重新分配
                                 'image_id': image_id,
                                 'image_relation_idx': image_relation_idx,
+                                'subject_id': subject_id,  # 添加subject_id以区分同名物体
+                                'object_id': object_id,  # 添加object_id以区分同名物体
                                 'subject': subject_obj['class_name'],
                                 'object': object_obj['class_name'],
                                 'gt_predicate': gt_predicate
@@ -591,6 +819,8 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
                             'relation_idx': relation_idx,
                             'global_relation_idx': -1,  # 将在主进程重新分配
                             'image_id': image_id,
+                            'subject_id': subject_id,  # 添加subject_id以区分同名物体
+                            'object_id': object_id,  # 添加object_id以区分同名物体
                             'subject': subject_obj['class_name'],
                             'object': object_obj['class_name'],
                             'gt_predicate': gt_predicates[0] if gt_predicates else None,
@@ -604,15 +834,24 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
             per_image_candidates[image_id] = image_candidates
             processed_images += 1
             
-            # 更新进度
-            if (img_idx + 1) % 10 == 0:
-                progress_queue.put((gpu_id, f"GPU{gpu_id}: 已处理 {img_idx + 1}/{len(data_shard)} 张图片"))
+            # 更新进度（每5张图片更新一次，平衡实时性和性能）
+            if processed_images % 5 == 0 or processed_images == total_images:
+                progress_queue.put((gpu_id, f"GPU{gpu_id}: 已处理 {processed_images}/{total_images} 张图片 ({processed_images*100//total_images}%)"))
+        
+        matched_count = total_pairs_checked - missing_cot_count
+        match_rate = (matched_count / total_pairs_checked * 100) if total_pairs_checked > 0 else 0
+        if missing_cot_count > 0:
+            progress_queue.put((gpu_id, f"⚠️  GPU{gpu_id}: 警告：{missing_cot_count}/{total_pairs_checked} 个配对因CoT描述为空而被跳过（匹配率: {match_rate:.1f}%）"))
+        else:
+            progress_queue.put((gpu_id, f"✅ GPU{gpu_id}: 所有 {total_pairs_checked} 个配对都成功匹配到CoT描述"))
         
         # 将结果放入队列
         result_queue.put({
             'gpu_id': gpu_id,
             'per_image_candidates': per_image_candidates,
-            'all_relations_info': all_relations_info
+            'all_relations_info': all_relations_info,
+            'missing_cot_count': missing_cot_count,  # 传递跳过的样本数量
+            'total_pairs_checked': total_pairs_checked  # 传递检查的配对总数
         })
         
         progress_queue.put((gpu_id, f"✅ GPU{gpu_id}: 完成处理 {processed_images} 张图片"))
@@ -630,13 +869,19 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
 
 def main():
     # 解析命令行参数
-    parser = argparse.ArgumentParser(description='场景图关系预测与Per-Image Recall@50计算')
+    parser = argparse.ArgumentParser(description='Stage3: 使用Stage2的CoT数据进行场景图关系预测与Per-Image Recall@50计算')
     parser.add_argument('--num_gpus', type=int, default=None,
                         help='指定使用的GPU数量（默认：使用所有可用GPU，或从NUM_GPUS环境变量/配置变量读取）')
     parser.add_argument('--input_file', type=str, default=None,
                         help='输入文件路径（默认：使用配置文件中的INPUT_FILE）')
+    parser.add_argument('--stage2_file', type=str, default=None,
+                        help='Stage2输出文件路径（默认：使用配置文件中的STAGE2_OUTPUT_FILE）')
     parser.add_argument('--output_file', type=str, default=None,
                         help='输出文件路径（默认：使用配置文件中的OUTPUT_FILE）')
+    parser.add_argument('--use_original_query', action='store_true', default=True,
+                        help='是否在cot_description前加上原始query（默认：False）')
+    parser.add_argument('--use_image', action='store_true', default=True,
+                        help='是否调用图像（默认：False）')
     args = parser.parse_args()
     
     # 确定使用的GPU数量（优先级：命令行参数 > 环境变量 > 配置变量 > 所有GPU）
@@ -650,10 +895,15 @@ def main():
     
     # 确定输入输出文件
     input_file = args.input_file if args.input_file else INPUT_FILE
+    stage2_file = args.stage2_file if args.stage2_file else STAGE2_OUTPUT_FILE
     output_file = args.output_file if args.output_file else OUTPUT_FILE
     
     print("="*80)
-    print("场景图关系预测与Per-Image Recall@50计算")
+    print("Stage3: 使用Stage2的CoT数据进行场景图关系预测与Per-Image Recall@50计算")
+    print("="*80)
+    print(f"\n配置选项:")
+    print(f"  使用原始query: {'是' if args.use_original_query else '否'}")
+    print(f"  使用图像: {'是' if args.use_image else '否'}")
     print("="*80)
 
     # 检测可用GPU数量
@@ -678,6 +928,9 @@ def main():
         else:
             print(f"\n✅ 使用指定的 {num_gpus} 个GPU (GPU 0-{num_gpus-1})")
     
+    # 加载Stage2的CoT数据
+    cot_map = load_stage2_cot_data(stage2_file)
+    
     # 加载数据
     print(f"\n📖 正在加载数据: {input_file}")
     with open(input_file, 'r') as f:
@@ -691,8 +944,8 @@ def main():
     model_args = ModelArguments(
         model_name='/public/home/xiaojw2025/Workspace/VLM2Vec/models/qwen_vl/Qwen2-VL-2B-Instruct',
         # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/qwen_vl/Qwen2-VL-2B-Instruct',
-        # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/VLM2Vec-Qwen2VL-2B',
-        checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/train_5k_ratio',
+        checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/VLM2Vec-Qwen2VL-2B',
+        # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/train_5k_balance',
         pooling='last',
         normalize=True,
         model_backbone='qwen2_vl',
@@ -724,6 +977,10 @@ def main():
     result_queue = Queue()  # 结果队列
     progress_queue = Queue()  # 进度队列
     
+    # 将cot_map转换为普通dict（multiprocessing需要可序列化的对象）
+    # 注意：Manager().dict()不支持嵌套dict，所以直接传递普通dict
+    # 由于cot_map是只读的，可以在每个进程中直接使用
+    
     # 启动多个进程
     processes = []
     for gpu_id in range(num_gpus):
@@ -731,7 +988,8 @@ def main():
             p = Process(
                 target=process_data_shard,
                 args=(gpu_id, data_shards[gpu_id], model_args, data_args, 
-                      predicate_vectors_dict, result_queue, progress_queue)
+                      predicate_vectors_dict, cot_map, result_queue, progress_queue,
+                      args.use_original_query, args.use_image)
             )
             p.start()
             processes.append(p)
@@ -743,38 +1001,53 @@ def main():
     
     def print_progress():
         """打印进度信息"""
+        updated = False
         while not progress_queue.empty():
             try:
                 gpu_id, message = progress_queue.get_nowait()
                 progress_messages[gpu_id] = message
+                updated = True
             except:
                 break
         
-        # 打印所有GPU的进度
-        for gpu_id in range(num_gpus):
-            if gpu_id in progress_messages:
-                print(f"   {progress_messages[gpu_id]}")
+        # 如果有更新，打印所有GPU的最新进度
+        if updated:
+            # 清屏并打印所有GPU的进度（使用\r实现覆盖）
+            for gpu_id in range(num_gpus):
+                if gpu_id in progress_messages:
+                    print(f"   {progress_messages[gpu_id]}", flush=True)
     
     # 等待所有进程完成并收集结果
     print("\n📈 推理进度:")
     all_results = {}
+    import time
+    last_print_time = time.time()
+    print_interval = 0.5  # 每0.5秒打印一次进度
     
     while len(completed_gpus) < len(processes):
+        current_time = time.time()
+        
+        # 定期打印进度（每0.5秒或队列不为空时）
+        if current_time - last_print_time >= print_interval or not progress_queue.empty():
+            print_progress()
+            last_print_time = current_time
+        
         # 检查是否有新结果
         try:
-            result = result_queue.get(timeout=1)
+            result = result_queue.get(timeout=0.1)  # 减少超时时间，更频繁检查进度
             if 'error' in result:
-                print(f"\n❌ {result['error']}")
+                print(f"\n❌ {result['error']}", flush=True)
                 completed_gpus.add(result['gpu_id'])
             else:
                 all_results[result['gpu_id']] = result
                 completed_gpus.add(result['gpu_id'])
-                print(f"   ✅ GPU {result['gpu_id']} 完成")
+                print(f"\n   ✅ GPU {result['gpu_id']} 完成", flush=True)
         except:
+            # 超时是正常的，继续循环检查进度
             pass
-        
-        # 打印进度
-        print_progress()
+    
+    # 最后打印一次所有GPU的最终进度
+    print_progress()
     
     # 等待所有进程结束
     for p in processes:
@@ -786,6 +1059,8 @@ def main():
     # 合并所有GPU的结果
     per_image_candidates = {}
     all_relations_info = []
+    total_missing_cot_count = 0  # 统计总的跳过样本数量
+    total_pairs_checked_all = 0  # 统计总的检查配对数量
     
     # 按GPU ID顺序合并结果
     for gpu_id in sorted(all_results.keys()):
@@ -796,6 +1071,12 @@ def main():
         # 合并每张图片的候选
         for image_id, candidates in result['per_image_candidates'].items():
             per_image_candidates[image_id] = candidates
+        
+        # 累计跳过的样本数量和检查的配对数量
+        if 'missing_cot_count' in result:
+            total_missing_cot_count += result['missing_cot_count']
+        if 'total_pairs_checked' in result:
+            total_pairs_checked_all += result['total_pairs_checked']
     
     # 重新分配关系索引（基于合并后的数据）
     print("   重新分配关系索引...")
@@ -806,30 +1087,44 @@ def main():
         candidates = per_image_candidates[image_id]
         image_relation_idx = 0
         
-        # 收集该图片的所有GT关系（去重）
+        # 收集该图片的所有GT关系（去重，使用物体ID区分同名物体）
         gt_relations_set = set()
         gt_relations_list = []
         for cand in candidates:
             if cand['has_gt'] and cand['gt_predicate']:
-                key = (cand['subject'], cand['object'], cand['gt_predicate'])
+                # 使用物体ID作为唯一标识，以区分同名物体
+                subject_id = cand.get('subject_id', None)
+                object_id = cand.get('object_id', None)
+                if subject_id is not None and object_id is not None:
+                    key = (subject_id, object_id, cand['gt_predicate'])
+                else:
+                    # 向后兼容：如果没有物体ID，则使用类别名
+                    key = (cand['subject'], cand['object'], cand['gt_predicate'])
                 if key not in gt_relations_set:
                     gt_relations_set.add(key)
                     gt_relations_list.append({
+                        'subject_id': subject_id,
+                        'object_id': object_id,
                         'subject': cand['subject'],
                         'object': cand['object'],
                         'gt_predicate': cand['gt_predicate']
                     })
         
         # 为每个GT关系分配全局索引
-        image_relation_idx_map = {}  # (subject, object, gt_predicate) -> relation_idx
+        image_relation_idx_map = {}  # (subject_id, object_id, gt_predicate) 或 (subject, object, gt_predicate) -> relation_idx
         for rel_info in gt_relations_list:
-            key = (rel_info['subject'], rel_info['object'], rel_info['gt_predicate'])
+            if rel_info['subject_id'] is not None and rel_info['object_id'] is not None:
+                key = (rel_info['subject_id'], rel_info['object_id'], rel_info['gt_predicate'])
+            else:
+                key = (rel_info['subject'], rel_info['object'], rel_info['gt_predicate'])
             image_relation_idx_map[key] = global_relation_idx
             
             all_relations_info.append({
                 'relation_idx': global_relation_idx,
                 'image_id': image_id,
                 'image_relation_idx': image_relation_idx,
+                'subject_id': rel_info['subject_id'],
+                'object_id': rel_info['object_id'],
                 'subject': rel_info['subject'],
                 'object': rel_info['object'],
                 'gt_predicate': rel_info['gt_predicate']
@@ -840,7 +1135,14 @@ def main():
         # 更新候选中的关系索引
         for cand in candidates:
             if cand['has_gt'] and cand['gt_predicate']:
-                key = (cand['subject'], cand['object'], cand['gt_predicate'])
+                # 使用物体ID进行匹配
+                subject_id = cand.get('subject_id', None)
+                object_id = cand.get('object_id', None)
+                if subject_id is not None and object_id is not None:
+                    key = (subject_id, object_id, cand['gt_predicate'])
+                else:
+                    # 向后兼容
+                    key = (cand['subject'], cand['object'], cand['gt_predicate'])
                 if key in image_relation_idx_map:
                     rel_idx = image_relation_idx_map[key]
                     cand['relation_idx'] = rel_idx
@@ -860,6 +1162,12 @@ def main():
     print(f"   总GT关系数: {len(all_relations_info)}")
     total_candidates = sum(len(candidates) for candidates in per_image_candidates.values())
     print(f"   总候选预测数: {total_candidates}")
+    if total_pairs_checked_all > 0:
+        matched_count_all = total_pairs_checked_all - total_missing_cot_count
+        match_rate_all = (matched_count_all / total_pairs_checked_all * 100) if total_pairs_checked_all > 0 else 0
+        print(f"   CoT匹配统计: {matched_count_all}/{total_pairs_checked_all} 个配对成功匹配（匹配率: {match_rate_all:.1f}%）")
+        if total_missing_cot_count > 0:
+            print(f"   ⚠️  跳过的样本数（CoT描述为空）: {total_missing_cot_count}")
     
     # 统计配对信息
     total_pairs = 0
@@ -890,13 +1198,19 @@ def main():
     print(f"总召回关系数: {recall_results['total_recalled_relations']}/{recall_results['total_gt_relations']}")
     
     # 计算平均配对统计
-    avg_total_pairs = sum(r.get('total_pairs', 0) for r in recall_results['per_image_results']) / len(recall_results['per_image_results'])
-    avg_gt_pairs = sum(r.get('gt_pairs', 0) for r in recall_results['per_image_results']) / len(recall_results['per_image_results'])
-    avg_non_gt_pairs = sum(r.get('non_gt_pairs', 0) for r in recall_results['per_image_results']) / len(recall_results['per_image_results'])
-    
-    print(f"平均每张图片预测配对对数: {avg_total_pairs:.1f}")
-    print(f"平均每张图片有GT的配对对数: {avg_gt_pairs:.1f}")
-    print(f"平均每张图片无GT的配对对数: {avg_non_gt_pairs:.1f}")
+    if len(recall_results['per_image_results']) > 0:
+        avg_total_pairs = sum(r.get('total_pairs', 0) for r in recall_results['per_image_results']) / len(recall_results['per_image_results'])
+        avg_gt_pairs = sum(r.get('gt_pairs', 0) for r in recall_results['per_image_results']) / len(recall_results['per_image_results'])
+        avg_non_gt_pairs = sum(r.get('non_gt_pairs', 0) for r in recall_results['per_image_results']) / len(recall_results['per_image_results'])
+        
+        print(f"平均每张图片预测配对对数: {avg_total_pairs:.1f}")
+        print(f"平均每张图片有GT的配对对数: {avg_gt_pairs:.1f}")
+        print(f"平均每张图片无GT的配对对数: {avg_non_gt_pairs:.1f}")
+    else:
+        print("⚠️  警告: 没有处理任何图片，无法计算平均配对统计")
+        print(f"平均每张图片预测配对对数: 0.0")
+        print(f"平均每张图片有GT的配对对数: 0.0")
+        print(f"平均每张图片无GT的配对对数: 0.0")
     
     if recall_results['images_with_insufficient_candidates'] > 0:
         print(f"候选数不足{recall_results['k']}的图片: {recall_results['images_with_insufficient_candidates']}/{recall_results['total_images']}")
@@ -966,7 +1280,8 @@ def main():
     print(f"\n💾 正在保存结果到: {output_file}")
     output_data = {
         'summary': {
-            'evaluation_method': 'per-image-all-pairs',
+            'evaluation_method': 'per-image-all-pairs-stage3',
+            'stage2_file': stage2_file,
             'total_images': len(per_image_candidates),
             'total_gt_relations': len(all_relations_info),
             'total_candidates': total_candidates,
@@ -982,7 +1297,12 @@ def main():
             'total_gt_pairs': total_gt_pairs,
             'total_non_gt_pairs': total_pairs - total_gt_pairs,
             'avg_pairs_per_image': total_pairs / len(per_image_candidates) if len(per_image_candidates) > 0 else 0,
-            'avg_gt_pairs_per_image': total_gt_pairs / len(per_image_candidates) if len(per_image_candidates) > 0 else 0
+            'avg_gt_pairs_per_image': total_gt_pairs / len(per_image_candidates) if len(per_image_candidates) > 0 else 0,
+            # 跳过的样本统计
+            'skipped_samples_missing_cot': total_missing_cot_count,
+            # 配置选项
+            'use_original_query': args.use_original_query,
+            'use_image': args.use_image
         },
         'per_image_results': recall_results['per_image_results'],
         'mean_recall_per_predicate': mean_recall_results['per_predicate_recall'],
