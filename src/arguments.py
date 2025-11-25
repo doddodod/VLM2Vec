@@ -69,6 +69,8 @@ class TrainingArguments(TrainingArguments):
     interleave_stopping_strategy: str = field(default="all_exhausted", metadata={"help": "all_exhausted or first_exhausted"})
     interleave_batch_size: float = field(default=0, metadata={"help": "Specify mini-batch size to interleave data from multi-sources, 0/None means random sampling by examples, 1 means full batch."})
     per_device_train_batch_size: int = field(default=8, metadata={"help": "batch size per device"})
+    use_ddp: bool = field(default=False, metadata={"help": "Use torch.distributed DistributedDataParallel (launch with torchrun)."})
+    ddp_backend: str = field(default='nccl', metadata={"help": "DDP backend to use ('nccl' or 'gloo')."})
 
 @dataclass
 class MTEBArguments:

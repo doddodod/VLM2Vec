@@ -12,10 +12,10 @@ import argparse
 
 # 添加项目根目录到Python路径，以便导入src模块
 # 脚本位于 embedding/infer/ 目录下，需要向上两级找到项目根目录
-script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(script_dir))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+# script_dir = os.path.dirname(os.path.abspath(__file__))
+# project_root = os.path.dirname(os.path.dirname(script_dir))
+# if project_root not in sys.path:
+#     sys.path.insert(0, project_root)
 
 
 def check_flash_attention_support():
@@ -92,8 +92,8 @@ from src.arguments import ModelArguments, DataArguments
 from src.model.processor import load_processor, QWEN2_VL, VLM_IMAGE_TOKENS
 
 
-INPUT_FILE = "/public/home/xiaojw2025/Workspace/RAHP/DATASET/VG150/test_case_20.json"
-OUTPUT_FILE = "/public/home/xiaojw2025/Data/embedding_similarity/vlm2vec_qwen2vl/result_recall_20_all.json"
+INPUT_FILE = "/public/home/wangby2025/plusLab/VLM2Vec/infer/test_2000_images.json"
+OUTPUT_FILE = "/public/home/wangby2025/plusLab/outputs/test_2000_recall/single_gpu_5_epoch.json"
 
 # 默认使用的GPU数量（None表示使用所有可用GPU）
 # 也可以通过命令行参数 --num_gpus 或环境变量 NUM_GPUS 指定
@@ -715,7 +715,7 @@ def main():
     model_args = ModelArguments(
         model_name='/public/home/xiaojw2025/Workspace/VLM2Vec/models/qwen_vl/Qwen2-VL-2B-Instruct',
         # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/qwen_vl/Qwen2-VL-2B-Instruct',
-        checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/VLM2Vec-Qwen2VL-2B',
+        # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/VLM2Vec-Qwen2VL-2B',
         # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/train_5k_balance',
         pooling='last',
         normalize=True,
@@ -1022,19 +1022,19 @@ def main():
     print(f"   收集了 {len(per_image_top100_candidates)} 张图片的Top-100候选")
     print(f"   总候选数: {total_top100_candidates}")
     
-    # 7.2 保存每张图片的所有候选（用于完整评估）
-    print("\n📦 正在整理每张图片的所有候选结果...")
-    per_image_all_candidates = {}
-    total_all_candidates = 0
+    # # 7.2 保存每张图片的所有候选（用于完整评估）
+    # print("\n📦 正在整理每张图片的所有候选结果...")
+    # per_image_all_candidates = {}
+    # total_all_candidates = 0
     
-    for image_id, candidates in per_image_candidates.items():
-        # 按相似度排序（保持一致性）
-        sorted_candidates = sorted(candidates, key=lambda x: x['similarity'], reverse=True)
-        per_image_all_candidates[image_id] = sorted_candidates
-        total_all_candidates += len(sorted_candidates)
+    # for image_id, candidates in per_image_candidates.items():
+    #     # 按相似度排序（保持一致性）
+    #     sorted_candidates = sorted(candidates, key=lambda x: x['similarity'], reverse=True)
+    #     per_image_all_candidates[image_id] = sorted_candidates
+    #     total_all_candidates += len(sorted_candidates)
     
-    print(f"   收集了 {len(per_image_all_candidates)} 张图片的所有候选")
-    print(f"   总候选数: {total_all_candidates}")
+    # print(f"   收集了 {len(per_image_all_candidates)} 张图片的所有候选")
+    # print(f"   总候选数: {total_all_candidates}")
     
     # 8. 保存结果
     print(f"\n💾 正在保存结果到: {output_file}")
@@ -1062,7 +1062,7 @@ def main():
         'mean_recall_per_predicate': mean_recall_results['per_predicate_recall'],
         'all_relations': all_relations_info,
         'per_image_top100_candidates': per_image_top100_candidates,  # 每张图片的Top-100候选（用于快速评估）
-        'per_image_all_candidates': per_image_all_candidates,  # 每张图片的所有候选（用于完整评估）
+        #‘per_image_all_candidates': per_image_all_candidates,  # 每张图片的所有候选（用于完整评估）
         'top50_global_candidates': top50_global_candidates,  # 全局排序的top50（参考用）
         # 'all_candidates': all_candidate_predictions  # 完整的候选列表（可选，可能很大，已通过per_image_all_candidates提供）
     }

@@ -4,7 +4,10 @@ import random
 from typing import Dict, Any, List, Optional
 
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from transformers import HfArgumentParser, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
 
@@ -111,15 +114,25 @@ class SGGContrastiveDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _full_image_path(self, path: str):
+    def _full_image_path(self, path: Optional[str]):
+        """Return the absolute path for the image or None if path is missing.
+
+        Accepts None and returns None so callers can handle missing images explicitly.
+        """
+        if not path:
+            return None
         return path if os.path.isabs(path) else os.path.join(self.image_dir, path)
 
-    def _make_image_field(self, path: str):
+    def _make_image_field(self, path: Optional[str]):
         full = self._full_image_path(path)
+        # If no path, return a placeholder image field where path is None.
         return {'resolutions': [None], 'paths': [full], 'bytes': [None]}
 
-    def _get_image_dimensions(self, image_path: str):
+    def _get_image_dimensions(self, image_path: Optional[str]):
         try:
+            if image_path is None:
+                # Missing image, return default fallback dimensions
+                return (1024, 1024)
             with Image.open(image_path) as img:
                 return img.size
         except Exception as e:
@@ -136,6 +149,11 @@ class SGGContrastiveDataset(Dataset):
         bbox2 = obj.get('bbox') or s.get('bbox2')
         subj_name = subj.get('class_name', 'objectA')
         obj_name = obj.get('class_name', 'objectB')
+
+        # Check for missing image and handle accordingly (raise or return placeholder)
+        if image_path is None:
+            # 可以选择抛出错误或返回一个占位样本（下面演示抛错）
+            raise ValueError(f"Missing image path for sample index {idx}: {s.get('id', idx)}")
 
         # 图像信息
         full_image_path = self._full_image_path(image_path)
@@ -234,15 +252,32 @@ def evaluate(model, val_loader, device, return_scores=False):
 # Train Loop
 # ------------------------------
 def train_loop(model_args: ModelArguments, data_args: DataArguments, training_args: TrainingArguments):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Determine distributed / multi-GPU setup
+    use_ddp = getattr(training_args, 'use_ddp', False) or int(os.environ.get("WORLD_SIZE", "1")) > 1
+    dist_initialized = False
+    rank = 0
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if use_ddp:
+        # Initialize distributed process group
+        backend = getattr(training_args, 'ddp_backend', 'nccl')
+        dist.init_process_group(backend=backend)
+        dist_initialized = True
+        rank = dist.get_rank()
+        try:
+            torch.cuda.set_device(local_rank)
+        except Exception:
+            pass
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("Loading processor...")
     processor = load_processor(model_args)
 
     print("Building model...")
     model = MMEBModel.build(model_args)
-    model = model.to(device)
-    model.train()
+    
 
     # 应用 LoRA
     if model_args.lora:
@@ -259,17 +294,39 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in model.parameters())
         print(f"📊 Trainable params: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
-
         
+    # Move model to device after applying LoRA (correct ordering)
+    model = model.to(device)
+    model.train()
+
     # -----------------------------
     # Initialize W&B
     # -----------------------------
-    wandb.init(
-        project="sgg_qwen2vl",
-        name=os.path.basename(training_args.output_dir.rstrip("/")),
-        config={**vars(model_args), **vars(data_args), **vars(training_args)},
-        mode="offline"  # <-- 离线模式
-    )
+    # Wrap model for multi-GPU
+    if dist_initialized:
+        # DistributedDataParallel: wrap the already-device-placed model
+        model = nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            find_unused_parameters=True,
+        )
+        is_main_process = (dist.get_rank() == 0)
+    elif torch.cuda.device_count() > 1 and torch.cuda.is_available():
+        # DataParallel fallback for single-node multi-GPU
+        model = nn.DataParallel(model)
+        is_main_process = True
+    else:
+        is_main_process = True
+
+    # Initialize W&B only on main process to avoid duplicate logs
+    if is_main_process:
+        wandb.init(
+            project="sgg_qwen2vl",
+            name=os.path.basename(training_args.output_dir.rstrip("/")),
+            config={**vars(model_args), **vars(data_args), **vars(training_args)},
+            mode="offline"  # <-- 离线模式
+        )
 
     # 准备数据
     dataset = SGGContrastiveDataset(
@@ -286,14 +343,26 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
         batch_size=training_args.per_device_train_batch_size
     )
 
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=training_args.per_device_train_batch_size, 
-        shuffle=True, 
-        collate_fn=collator,
-        num_workers=0,  # 可根据需要调整
-        pin_memory=True if torch.cuda.is_available() else False
-    )
+    # Use DistributedSampler when DDP is enabled
+    if dist_initialized:
+        train_sampler = DistributedSampler(dataset, shuffle=True)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=training_args.per_device_train_batch_size,
+            sampler=train_sampler,
+            collate_fn=collator,
+            num_workers=0,
+            pin_memory=True if torch.cuda.is_available() else False,
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=training_args.per_device_train_batch_size,
+            shuffle=True,
+            collate_fn=collator,
+            num_workers=0,  # 可根据需要调整
+            pin_memory=True if torch.cuda.is_available() else False
+        )
 
     # ---------- evaluation dataset/loader (optional) ----------
     # Use the eval path supplied in DataArguments. The default should be set in `src/arguments.py`.
@@ -307,14 +376,25 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
                 num_negatives=data_args.num_negatives
             )
             eval_batch_size = getattr(training_args, 'per_device_eval_batch_size', training_args.per_device_train_batch_size)
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=eval_batch_size,
-                shuffle=False,
-                collate_fn=collator,
-                num_workers=0,
-                pin_memory=True if torch.cuda.is_available() else False
-            )
+            if dist_initialized:
+                val_sampler = DistributedSampler(val_dataset, shuffle=False)
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=eval_batch_size,
+                    sampler=val_sampler,
+                    collate_fn=collator,
+                    num_workers=0,
+                    pin_memory=True if torch.cuda.is_available() else False,
+                )
+            else:
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=eval_batch_size,
+                    shuffle=False,
+                    collate_fn=collator,
+                    num_workers=0,
+                    pin_memory=True if torch.cuda.is_available() else False
+                )
             print(f"✅ Eval dataset loaded: {len(val_dataset)} samples from {eval_json}")
         except Exception as e:
             val_loader = None
@@ -352,11 +432,22 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
     best_loss = float('inf')
     best_eval_loss = float('inf')
 
+
+    print("WORLD_SIZE =", os.environ.get("WORLD_SIZE"))
+    print("LOCAL_RANK =", os.environ.get("LOCAL_RANK"))
+    print("DDP =", use_ddp)
+
+
     # 训练循环
     for epoch in range(int(training_args.num_train_epochs)):
         model.train()
         epoch_losses = []
         optimizer.zero_grad()
+        if dist_initialized:
+            try:
+                dataloader.sampler.set_epoch(epoch)
+            except Exception:
+                pass
         
         for batch_idx, (qry_inputs, pos_inputs, neg_inputs) in enumerate(dataloader):
             qry_inputs = batch_to_device(qry_inputs, device)
@@ -385,76 +476,97 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
                 # Log to W&B
                 current_lr = scheduler.get_last_lr()[0]
                 step_loss = loss_tensor.item() * training_args.gradient_accumulation_steps
-                wandb.log({
-                    "train/loss_step": step_loss,
-                    "lr": current_lr,
-                    "epoch": epoch+1,
-                    "global_step": global_step
-                }, step=global_step)
-                if global_step % 100 == 0:
-                    print(f"[Step {global_step}] Epoch {epoch+1} | Loss: {step_loss:.4f} | LR: {current_lr:.2e}")
+                if is_main_process:
+                    wandb.log({
+                        "train/loss_step": step_loss,
+                        "lr": current_lr,
+                        "epoch": epoch+1,
+                        "global_step": global_step
+                    }, step=global_step)
+                    if global_step % 100 == 0:
+                        print(f"[Step {global_step}] Epoch {epoch+1} | Loss: {step_loss:.4f} | LR: {current_lr:.2e}")
 
                 global_step += 1
 
                 # 定期 evaluation（如果配置了 eval_steps 并且成功加载了 val_loader）
                 if hasattr(training_args, 'eval_steps') and getattr(training_args, 'eval_steps') and val_loader is not None:
                     if global_step % int(training_args.eval_steps) == 0:
-                        val_loss = evaluate(model, val_loader, device)
-                        wandb.log({"eval/loss": val_loss, "step": global_step})
-                        print(f"[Eval Step {global_step}] Validation Loss: {val_loss:.4f}")
+                        # Only run evaluation and saving on the main process
+                        if is_main_process:
+                            val_loss = evaluate(model, val_loader, device)
+                            wandb.log({"eval/loss": val_loss, "step": global_step})
+                            print(f"[Eval Step {global_step}] Validation Loss: {val_loss:.4f}")
 
-                        # 根据 eval loss 保存最佳模型（可选）
-                        if val_loss < best_eval_loss:
-                            best_eval_loss = val_loss
-                            best_dir_eval = os.path.join(training_args.output_dir, "best_model_eval")
-                            os.makedirs(best_dir_eval, exist_ok=True)
-                            model.save(best_dir_eval)
-                            print(f"🏆 New best eval model saved at step {global_step} (val_loss: {best_eval_loss:.4f})")
+                            # 根据 eval loss 保存最佳模型（可选）
+                            if val_loss < best_eval_loss:
+                                best_eval_loss = val_loss
+                                best_dir_eval = os.path.join(training_args.output_dir, "best_model_eval")
+                                os.makedirs(best_dir_eval, exist_ok=True)
+                                model_to_save = model.module if hasattr(model, 'module') else model
+                                model_to_save.save(best_dir_eval)
+                                print(f"🏆 New best eval model saved at step {global_step} (val_loss: {best_eval_loss:.4f})")
                            
         # Epoch 结束
         avg_epoch_loss = np.mean(epoch_losses)
-        wandb.log({"train/epoch_loss": avg_epoch_loss, "epoch": epoch+1})
-        print(f"📊 Epoch {epoch+1} Avg Loss: {avg_epoch_loss:.4f} [W&B logged]\n")
+        if is_main_process:
+            wandb.log({"train/epoch_loss": avg_epoch_loss, "epoch": epoch+1})
+            print(f"📊 Epoch {epoch+1} Avg Loss: {avg_epoch_loss:.4f} [W&B logged]\n")
 
-        # Evaluate at the end of each epoch and track eval loss
-        if val_loader is not None:
+        # Evaluate at the end of each epoch and track eval loss (only main process)
+        if val_loader is not None and is_main_process:
             val_loss_epoch = evaluate(model, val_loader, device)
             wandb.log({"eval/epoch_loss": val_loss_epoch, "epoch": epoch+1})
             print(f"📊 Epoch {epoch+1} Validation Loss: {val_loss_epoch:.4f} [W&B logged]")
-        
-        print(f"\n📊 Epoch {epoch+1} Summary:")
-        print(f"  Average Loss: {avg_epoch_loss:.6f}")
-        print(f"  Min Loss: {min(epoch_losses):.6f}")
-        print(f"  Max Loss: {max(epoch_losses):.6f}")
 
-        # 保存 checkpoint
-        if (epoch + 1) % training_args.save_steps == 0 or (epoch + 1) == int(training_args.num_train_epochs):
+        if is_main_process:
+            print(f"\n📊 Epoch {epoch+1} Summary:")
+            print(f"  Average Loss: {avg_epoch_loss:.6f}")
+            print(f"  Min Loss: {min(epoch_losses):.6f}")
+            print(f"  Max Loss: {max(epoch_losses):.6f}")
+
+        # 保存 checkpoint (main process only)
+        if is_main_process and ((epoch + 1) % training_args.save_steps == 0 or (epoch + 1) == int(training_args.num_train_epochs)):
             save_dir = os.path.join(training_args.output_dir, f"checkpoint-epoch{epoch+1}")
             os.makedirs(save_dir, exist_ok=True)
-            model.save(save_dir)
+            model_to_save = model.module if hasattr(model, 'module') else model
+            model_to_save.save(save_dir)
             print(f"💾 Checkpoint saved to: {save_dir}")
 
-        # 保存最佳模型
-        if avg_epoch_loss < best_loss:
+        # 保存最佳模型 (main process only)
+        if is_main_process and avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
             wandb.run.summary["best_train_loss"] = best_loss
             best_dir = os.path.join(training_args.output_dir, "best_model")
             os.makedirs(best_dir, exist_ok=True)
-            model.save(best_dir)
+            model_to_save = model.module if hasattr(model, 'module') else model
+            model_to_save.save(best_dir)
             print(f"🏆 Best model saved — loss: {best_loss:.6f} — {best_dir}")
 
-    # 最终保存
-    final_dir = os.path.join(training_args.output_dir, "final")
-    os.makedirs(final_dir, exist_ok=True)
-    model.save(final_dir)
-    wandb.finish()
+    # 最终保存 (只在主进程执行)
+    if is_main_process:
+        final_dir = os.path.join(training_args.output_dir, "final")
+        os.makedirs(final_dir, exist_ok=True)
+        model_to_save = model.module if hasattr(model, 'module') else model
+        model_to_save.save(final_dir)
+        wandb.finish()
 
-    print(f"\n{'='*60}")
-    print("✅ Training Complete!")
-    print(f"{'='*60}")
-    print(f"📁 Final model saved to: {final_dir}")
-    print(f"🏆 Best model saved to: {os.path.join(training_args.output_dir, 'best_model')}")
-    print(f"🎯 Best loss: {best_loss:.6f}")
+        print(f"\n{'='*60}")
+        print("✅ Training Complete!")
+        print(f"{'='*60}")
+        print(f"📁 Final model saved to: {final_dir}")
+        print(f"🏆 Best model saved to: {os.path.join(training_args.output_dir, 'best_model')}")
+        print(f"🎯 Best loss: {best_loss:.6f}")
+
+    # Cleanup distributed process group
+    if dist_initialized:
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 # ------------------------------
