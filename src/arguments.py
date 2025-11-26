@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from transformers import TrainingArguments
+from transformers import TrainingArguments as HFTrainingArguments
 from typing import List, Optional
 
 
@@ -56,7 +56,7 @@ class DataArguments:
 
 
 @dataclass
-class TrainingArguments(TrainingArguments):
+class TrainingArguments(HFTrainingArguments):
     image_encoder_freeze: bool = field(default=False, metadata={"help": "huggingface model name"})
     output_dir: str = field(default=None, metadata={"help": "directory for saving trained models"})
     resume_from: str = field(default="none", metadata={"help": "`auto` will detect if any previous checkpoints should be resumed. or specify specific step of the checkpoint."})
@@ -71,6 +71,32 @@ class TrainingArguments(TrainingArguments):
     per_device_train_batch_size: int = field(default=8, metadata={"help": "batch size per device"})
     use_ddp: bool = field(default=False, metadata={"help": "Use torch.distributed DistributedDataParallel (launch with torchrun)."})
     ddp_backend: str = field(default='nccl', metadata={"help": "DDP backend to use ('nccl' or 'gloo')."})
+    # ===== 新增：Random & Determinism =====
+    seed: int = field(default=42, metadata={"help": "random seed for reproducibility"})
+    deterministic: bool = field(default=True, metadata={"help": "enable deterministic mode for reproducibility"})
+    
+    # ===== 新增：DDP Configuration =====
+    find_unused_parameters: bool = field(default=True, metadata={"help": "find unused parameters in DDP mode"})
+    
+    # ===== 新增：Weights & Biases =====
+    use_wandb: bool = field(default=True, metadata={"help": "whether to use Weights & Biases for logging"})
+    wandb_project: str = field(default="sgg_qwen2vl", metadata={"help": "W&B project name"})
+    wandb_mode: str = field(default="offline", metadata={"help": "W&B mode: 'online' or 'offline'"})
+    
+    # ===== 新增：DataLoader Configuration =====
+    dataloader_num_workers: int = field(default=4, metadata={"help": "number of workers for DataLoader"})
+    
+    # ===== 新增：Evaluation Configuration =====
+    per_device_eval_batch_size: int = field(default=None, metadata={"help": "batch size per device for evaluation. If None, use per_device_train_batch_size"})
+    eval_steps: int = field(default=None, metadata={"help": "evaluate every N steps. If None, only evaluate at epoch end"})
+    
+    # ===== 新增：Training Loop Configuration =====
+    show_progress_bar: bool = field(default=False, metadata={"help": "show progress bar during training"})
+    max_grad_norm: float = field(default=1.0, metadata={"help": "maximum gradient norm for clipping"})
+    warmup_ratio: float = field(default=0.1, metadata={"help": "warmup ratio relative to total steps"})
+    save_steps: int = field(default=None, metadata={"help": "save checkpoint every N epochs (default: at end of each epoch)"})
+
+
 
 @dataclass
 class MTEBArguments:
