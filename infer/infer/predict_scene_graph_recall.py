@@ -9,13 +9,12 @@ import warnings
 from multiprocessing import Process, Queue, Manager
 import math
 import argparse
+from peft import PeftModel
 
-# 添加项目根目录到Python路径，以便导入src模块
-# 脚本位于 embedding/infer/ 目录下，需要向上两级找到项目根目录
-# script_dir = os.path.dirname(os.path.abspath(__file__))
-# project_root = os.path.dirname(os.path.dirname(script_dir))
-# if project_root not in sys.path:
-#     sys.path.insert(0, project_root)
+# 方法 1：直接用当前工作目录（推荐，因为你从项目根目录运行）
+current_dir = os.getcwd()
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
 
 def check_flash_attention_support():
@@ -93,7 +92,7 @@ from src.model.processor import load_processor, QWEN2_VL, VLM_IMAGE_TOKENS
 
 
 INPUT_FILE = "/public/home/wangby2025/plusLab/VLM2Vec/infer/test_2000_images.json"
-OUTPUT_FILE = "/public/home/wangby2025/plusLab/outputs/test_2000_recall/single_gpu_5_epoch.json"
+OUTPUT_FILE = "/public/home/wangby2025/plusLab/outputs/test_2000_recall/one_card_balanced.json"
 
 # 默认使用的GPU数量（None表示使用所有可用GPU）
 # 也可以通过命令行参数 --num_gpus 或环境变量 NUM_GPUS 指定
@@ -454,36 +453,26 @@ def calculate_average_recall_at_k(per_image_candidates, k=50):
 
 
 def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vectors_dict, result_queue, progress_queue):
-    """
-    在指定GPU上处理数据分片
-    
-    Args:
-        gpu_id: GPU ID (0, 1, 2, ...)
-        data_shard: 该GPU要处理的数据分片（图片列表）
-        model_args: 模型参数
-        data_args: 数据参数
-        predicate_vectors_dict: 共享的谓词向量字典（通过Manager创建）
-        result_queue: 结果队列
-        progress_queue: 进度队列
-    """
     device = f'cuda:{gpu_id}'
     torch.cuda.set_device(gpu_id)
     
     try:
-        # 加载处理器和模型（每个进程独立加载）
         processor = load_processor(model_args, data_args)
         
-        # 尝试加载模型
         try:
+            # ✅ 直接使用 load 方法，它会自动处理 LoRA
             model = MMEBModel.load(model_args, is_trainable=False)
             model = model.to(device, dtype=torch.bfloat16)
             model.eval()
+            
+            progress_queue.put((gpu_id, f"GPU{gpu_id}: 模型加载成功"))
+            
         except Exception as e:
             error_msg = str(e)
             if ("flash" in error_msg.lower() or 
                 "ampere" in error_msg.lower() or 
                 "attention" in error_msg.lower() and "support" in error_msg.lower()):
-                # 强制使用eager模式
+                
                 os.environ["ATTN_IMPLEMENTATION"] = "eager"
                 os.environ["USE_FLASH_ATTENTION"] = "0"
                 
@@ -493,9 +482,12 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
                 from src.model.model import MMEBModel as MMEBModelReloaded
                 
                 processor = load_processor(model_args, data_args)
+                # ✅ 同样直接使用 load 方法
                 model = MMEBModelReloaded.load(model_args, is_trainable=False)
                 model = model.to(device, dtype=torch.bfloat16)
                 model.eval()
+                
+                progress_queue.put((gpu_id, f"GPU{gpu_id}: 模型加载成功（eager模式）"))
             else:
                 raise
         
@@ -522,6 +514,7 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
         progress_queue.put((gpu_id, f"GPU{gpu_id}: 开始处理 {total_images} 张图片"))
         
         for img_idx, img_data in enumerate(data_shard):
+            # ... 后续代码保持不变 ...
             image_id = img_data['image_id']
             image_path = img_data['image_path']
             objects = img_data['objects']
@@ -580,11 +573,11 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
                     if has_gt:
                         for gt_predicate in gt_predicates:
                             all_relations_info.append({
-                                'relation_idx': -1,  # 将在主进程重新分配
+                                'relation_idx': -1,
                                 'image_id': image_id,
                                 'image_relation_idx': image_relation_idx,
-                                'subject_id': subject_id,  # 添加subject_id以区分同名物体
-                                'object_id': object_id,  # 添加object_id以区分同名物体
+                                'subject_id': subject_id,
+                                'object_id': object_id,
                                 'subject': subject_obj['class_name'],
                                 'object': object_obj['class_name'],
                                 'gt_predicate': gt_predicate
@@ -592,7 +585,6 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
                             image_relation_idx += 1
                     
                     # 将该配对的50个谓词候选加入候选池
-                    # 计算该配对对应的关系索引起始值
                     relation_idx_start = image_relation_idx - len(gt_predicates) if has_gt else -1
                     
                     for pred_score in predicate_scores:
@@ -611,10 +603,10 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
                         
                         image_candidates.append({
                             'relation_idx': relation_idx,
-                            'global_relation_idx': -1,  # 将在主进程重新分配
+                            'global_relation_idx': -1,
                             'image_id': image_id,
-                            'subject_id': subject_id,  # 添加subject_id以区分同名物体
-                            'object_id': object_id,  # 添加object_id以区分同名物体
+                            'subject_id': subject_id,
+                            'object_id': object_id,
                             'subject': subject_obj['class_name'],
                             'object': object_obj['class_name'],
                             'gt_predicate': gt_predicates[0] if gt_predicates else None,
@@ -628,7 +620,7 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
             per_image_candidates[image_id] = image_candidates
             processed_images += 1
             
-            # 更新进度（每5张图片更新一次，平衡实时性和性能）
+            # 更新进度
             if processed_images % 5 == 0 or processed_images == total_images:
                 progress_queue.put((gpu_id, f"GPU{gpu_id}: 已处理 {processed_images}/{total_images} 张图片 ({processed_images*100//total_images}%)"))
         
@@ -649,8 +641,6 @@ def process_data_shard(gpu_id, data_shard, model_args, data_args, predicate_vect
             'error': error_msg
         })
         progress_queue.put((gpu_id, f"❌ {error_msg}"))
-
-
 
 def main():
     # 解析命令行参数
@@ -713,10 +703,10 @@ def main():
     
     # 准备模型参数
     model_args = ModelArguments(
-        model_name='/public/home/xiaojw2025/Workspace/VLM2Vec/models/qwen_vl/Qwen2-VL-2B-Instruct',
+        model_name='/public/home/wangby2025/plusLab/VLM2Vec/model/Qwen/Qwen2-VL-2B-Instruct',
         # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/qwen_vl/Qwen2-VL-2B-Instruct',
         # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/VLM2Vec-Qwen2VL-2B',
-        # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/train_5k_balance',
+        checkpoint_path='/public/home/wangby2025/plusLab/outputs/sgg_qwen2vl_balanced/best_model_eval',
         pooling='last',
         normalize=True,
         model_backbone='qwen2_vl',

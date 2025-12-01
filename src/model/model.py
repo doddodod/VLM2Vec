@@ -8,7 +8,7 @@ from src.model.processor import QWEN2_5_VL_TOKENSELECTION
 from src.arguments import ModelArguments, TrainingArguments
 from src.model.processor import LLAVA_NEXT, QWEN2_VL, PHI3V, get_backbone_name, print_master, QWEN2_5_VL, \
     backbone2model, QWEN2_VL_TOKENSELECTION, QWEN2_5_VL_TOKENSELECTION, E5_V
-
+import os
 from src.arguments import ModelArguments
 from src.model.processor import LLAVA_NEXT, QWEN2_VL, PHI3V, get_backbone_name, print_master, QWEN2_5_VL, INTERNVIDEO2, \
     QWEN2_VL_TOKENSELECTION, backbone2model, GME, VLM_IMAGE_TOKENS, LamRA, LamRA_QWEN2_5, COLPALI
@@ -210,84 +210,259 @@ class MMEBModel(nn.Module):
             )
         return model
 
-
     @classmethod
     def load(cls, model_args: ModelArguments, is_trainable=True, **kwargs):
-        # Loading the base model
+        """Load Qwen2-VL style backbone and (optionally) a LoRA adapter.
+        
+        KEY FIX: During training, the LoRA was applied to base_model wrapped in MMEBModel.
+        During inference, we need to replicate that exact structure.
+        """
+        
+        # ===== STEP 1: Determine paths =====
         model_name_or_path = model_args.checkpoint_path if model_args.checkpoint_path else model_args.model_name
-        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+        backbone_path = model_args.model_name  # 原始 backbone 路径
+        lora_path = model_args.checkpoint_path if model_args.checkpoint_path else None  # LoRA 路径（如果有）
+        
+        # ===== STEP 2: Get backbone type =====
+        config = AutoConfig.from_pretrained(backbone_path, trust_remote_code=True)
         if not hasattr(model_args, "model_backbone") or not model_args.model_backbone:
             model_backbone = get_backbone_name(hf_config=config, model_type=model_args.model_type)
             setattr(model_args, 'model_backbone', model_backbone)
-        print_master(f'Loading backbone [{model_args.model_backbone}] from {model_name_or_path}')
+        
+        print_master(f'Loading backbone [{model_args.model_backbone}] from {backbone_path}')
+
+        # ===== STEP 3: Load base model from ORIGINAL backbone =====
         if model_args.model_backbone in {LLAVA_NEXT, QWEN2_VL, QWEN2_5_VL, QWEN2_VL_TOKENSELECTION, QWEN2_5_VL_TOKENSELECTION, E5_V}:
-            config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
-            config._attn_implementation = "flash_attention_2"
-            config.vision_config._attn_implementation = "flash_attention_2"
+            base_config = AutoConfig.from_pretrained(backbone_path, trust_remote_code=True)
+            base_config._attn_implementation = "flash_attention_2"
+            base_config.vision_config._attn_implementation = "flash_attention_2"
+            
             base_model = backbone2model[model_args.model_backbone].from_pretrained(
-                model_args.model_name,
+                backbone_path,
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
-                config=config
+                config=base_config
             )
         elif model_args.model_backbone == PHI3V:
-            config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
-            config.use_cache = False
-            config.padding_side = "right"
-            base_model = Phi3VForCausalLM.from_pretrained(model_args.model_name, **kwargs, config=config,
-                                                          torch_dtype=torch.bfloat16, trust_remote_code=True)
+            base_config = AutoConfig.from_pretrained(backbone_path, trust_remote_code=True)
+            base_config.use_cache = False
+            base_config.padding_side = "right"
+            base_model = Phi3VForCausalLM.from_pretrained(
+                backbone_path,
+                **kwargs, 
+                config=base_config,
+                torch_dtype=torch.bfloat16, 
+                trust_remote_code=True
+            )
             base_model.padding_side = "right"
         elif model_args.model_backbone == INTERNVIDEO2:
             print_master(f'Loading backbone [{model_args.model_backbone}] from {"src/model/vlm_backbone/internvideo2/"}')
-            config = AutoConfig.from_pretrained("src/model/vlm_backbone/internvideo2/",
-                                                trust_remote_code=True)
-            base_model = backbone2model[model_args.model_backbone].from_pretrained("src/model/vlm_backbone/internvideo2/", config=config,
-                                                                                   trust_remote_code=True)
+            base_config = AutoConfig.from_pretrained("src/model/vlm_backbone/internvideo2/", trust_remote_code=True)
+            base_model = backbone2model[model_args.model_backbone].from_pretrained(
+                "src/model/vlm_backbone/internvideo2/", 
+                config=base_config,
+                trust_remote_code=True
+            )
         elif model_args.model_backbone == GME:
-            base_model = GmeQwen2VL(model_args.model_name, processor=kwargs['processor'])
-            setattr(base_model, 'config', config)
+            base_model = GmeQwen2VL(backbone_path, processor=kwargs['processor'])
+            setattr(base_model, 'config', AutoConfig.from_pretrained(backbone_path, trust_remote_code=True))
         elif model_args.model_backbone == LamRA:
-            base_model = LamRAQwen2VL(model_args.model_name)
-            setattr(base_model, 'config', config)
+            base_model = LamRAQwen2VL(backbone_path)
+            setattr(base_model, 'config', AutoConfig.from_pretrained(backbone_path, trust_remote_code=True))
         elif model_args.model_backbone == LamRA_QWEN2_5:
-            base_model = LamRAQwen25VL(model_args.model_name)
-            setattr(base_model, 'config', config)
+            base_model = LamRAQwen25VL(backbone_path)
+            setattr(base_model, 'config', AutoConfig.from_pretrained(backbone_path, trust_remote_code=True))
         elif model_args.model_backbone == COLPALI:
-            base_model = ColPali.from_pretrained(model_args.model_name)
-            setattr(base_model, 'config', config)
+            base_model = ColPali.from_pretrained(backbone_path)
+            setattr(base_model, 'config', AutoConfig.from_pretrained(backbone_path, trust_remote_code=True))
         else:
-            # Loading external base model from HF
-            config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
-            config.use_cache = False
+            base_config = AutoConfig.from_pretrained(backbone_path, trust_remote_code=True)
+            base_config.use_cache = False
             base_model = cls.TRANSFORMER_CLS.from_pretrained(
-                model_name_or_path, **kwargs, config=config,
+                backbone_path,
+                **kwargs, 
+                config=base_config,
                 torch_dtype=torch.bfloat16,
-                trust_remote_code=True)
+                trust_remote_code=True
+            )
 
-        # Building the model on top of the base
-        if model_args.lora:
-            print_master(f'Loading LoRA from {model_name_or_path}')
-            lora_config = LoraConfig.from_pretrained(model_name_or_path)
-            lora_model = PeftModel.from_pretrained(base_model, model_name_or_path, config=lora_config, is_trainable=is_trainable)
-            lora_model.load_adapter(model_name_or_path, lora_model.active_adapter, is_trainable=is_trainable)
-            if not is_trainable:
-                lora_model = lora_model.merge_and_unload()
+        # ===== STEP 4: Handle LoRA loading =====
+        if model_args.lora and lora_path:
+            print_master(f"Loading LoRA from {lora_path}")
+            
+            if not os.path.isdir(lora_path):
+                raise FileNotFoundError(f"LoRA path does not exist: {lora_path}")
+            
+            # 检查必要文件
+            adapter_config_path = os.path.join(lora_path, "adapter_config.json")
+            adapter_model_path = os.path.join(lora_path, "adapter_model.safetensors")
+            
+            if not os.path.exists(adapter_config_path):
+                raise FileNotFoundError(f"adapter_config.json not found in {lora_path}")
+            if not os.path.exists(adapter_model_path):
+                print_master(f"adapter_model.safetensors not found in {lora_path}, trying .bin")
+                adapter_model_path = os.path.join(lora_path, "adapter_model.bin")
+                if not os.path.exists(adapter_model_path):
+                    raise FileNotFoundError(f"adapter_model file not found in {lora_path}")
+            
+            try:
+                # 关键：使用 get_peft_model 来应用 LoRA，和训练时保持一致
+                from peft import LoraConfig, get_peft_model
+                
+                # 从 adapter_config.json 读取 LoRA 配置
+                lora_config = LoraConfig.from_pretrained(lora_path)
+                print_master(f"LoRA config: r={lora_config.r}, lora_alpha={lora_config.lora_alpha}")
+                
+                # 应用 LoRA 到 base_model（和训练时一致）
+                lora_encoder = get_peft_model(base_model, lora_config)
+                
+                # 手动加载权重
+                from peft.utils import get_peft_model_state_dict
+                import safetensors.torch
+                
+                adapter_weights = safetensors.torch.load_file(
+                    os.path.join(lora_path, "adapter_model.safetensors")
+                )
+                
+                # 重命名键以匹配模型结构
+                renamed_weights = {}
+                skipped_keys = []
+                for key, value in adapter_weights.items():
+                    # 跳过 magnitude_vector（DoRA 权重），因为模型可能没有这些层
+                    if 'lora_magnitude_vector' in key:
+                        skipped_keys.append(key)
+                        continue
+                    
+                    # 步骤1：删除多余的嵌套 base_model.model
+                    if key.startswith("base_model.model.base_model."):
+                        new_key = key.replace("base_model.model.base_model.", "base_model.", 1)
+                    else:
+                        new_key = key
+                    
+                    # 步骤2：加上 .default 前缀
+                    if '.lora_A.weight' in new_key:
+                        new_key = new_key.replace('.lora_A.weight', '.lora_A.default.weight')
+                    elif '.lora_B.weight' in new_key:
+                        new_key = new_key.replace('.lora_B.weight', '.lora_B.default.weight')
+                    
+                    renamed_weights[new_key] = value
+                
+                if skipped_keys:
+                    print_master(f"⚠️ Skipped {len(skipped_keys)} DoRA magnitude_vector keys (not available in current model)")
+                
+                # 加载权重
+                lora_encoder.load_state_dict(renamed_weights, strict=False)
+                print_master(f"✅ LoRA weights loaded successfully ({len(renamed_weights)} keys loaded)")
+                
+
+                
+            except Exception as e:
+                print_master(f"❌ Failed to load LoRA: {e}")
+                import traceback
+                print_master(traceback.format_exc())
+                lora_encoder = base_model
+            
+            # 推理模式：合并 LoRA 权重
+            if not is_trainable and lora_encoder is not base_model:
+                try:
+                    lora_encoder = lora_encoder.merge_and_unload()
+                    print_master(f"LoRA merged into base model for inference")
+                except Exception as e:
+                    print_master(f"Warning: merge_and_unload failed: {e}")
+            
             model = cls(
-                encoder=lora_model,
+                encoder=lora_encoder,
                 pooling=model_args.pooling,
                 normalize=model_args.normalize,
-                temperature=model_args.temperature
+                temperature=model_args.temperature,
             )
         else:
             model = cls(
                 encoder=base_model,
                 pooling=model_args.pooling,
                 normalize=model_args.normalize,
-                temperature=model_args.temperature
+                temperature=model_args.temperature,
             )
-
+        
         model.model_backbone = model_args.model_backbone
         return model
+
+    # def load(cls, model_args: ModelArguments, is_trainable=True, **kwargs):
+    #     # Loading the base model
+    #     model_name_or_path = model_args.checkpoint_path if model_args.checkpoint_path else model_args.model_name
+    #     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    #     if not hasattr(model_args, "model_backbone") or not model_args.model_backbone:
+    #         model_backbone = get_backbone_name(hf_config=config, model_type=model_args.model_type)
+    #         setattr(model_args, 'model_backbone', model_backbone)
+    #     print_master(f'Loading backbone [{model_args.model_backbone}] from {model_name_or_path}')
+    #     if model_args.model_backbone in {LLAVA_NEXT, QWEN2_VL, QWEN2_5_VL, QWEN2_VL_TOKENSELECTION, QWEN2_5_VL_TOKENSELECTION, E5_V}:
+    #         config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
+    #         config._attn_implementation = "flash_attention_2"
+    #         config.vision_config._attn_implementation = "flash_attention_2"
+    #         base_model = backbone2model[model_args.model_backbone].from_pretrained(
+    #             model_args.model_name,
+    #             torch_dtype=torch.bfloat16,
+    #             low_cpu_mem_usage=True,
+    #             config=config
+    #         )
+    #     elif model_args.model_backbone == PHI3V:
+    #         config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
+    #         config.use_cache = False
+    #         config.padding_side = "right"
+    #         base_model = Phi3VForCausalLM.from_pretrained(model_args.model_name, **kwargs, config=config,
+    #                                                       torch_dtype=torch.bfloat16, trust_remote_code=True)
+    #         base_model.padding_side = "right"
+    #     elif model_args.model_backbone == INTERNVIDEO2:
+    #         print_master(f'Loading backbone [{model_args.model_backbone}] from {"src/model/vlm_backbone/internvideo2/"}')
+    #         config = AutoConfig.from_pretrained("src/model/vlm_backbone/internvideo2/",
+    #                                             trust_remote_code=True)
+    #         base_model = backbone2model[model_args.model_backbone].from_pretrained("src/model/vlm_backbone/internvideo2/", config=config,
+    #                                                                                trust_remote_code=True)
+    #     elif model_args.model_backbone == GME:
+    #         base_model = GmeQwen2VL(model_args.model_name, processor=kwargs['processor'])
+    #         setattr(base_model, 'config', config)
+    #     elif model_args.model_backbone == LamRA:
+    #         base_model = LamRAQwen2VL(model_args.model_name)
+    #         setattr(base_model, 'config', config)
+    #     elif model_args.model_backbone == LamRA_QWEN2_5:
+    #         base_model = LamRAQwen25VL(model_args.model_name)
+    #         setattr(base_model, 'config', config)
+    #     elif model_args.model_backbone == COLPALI:
+    #         base_model = ColPali.from_pretrained(model_args.model_name)
+    #         setattr(base_model, 'config', config)
+    #     else:
+    #         # Loading external base model from HF
+    #         config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
+    #         config.use_cache = False
+    #         base_model = cls.TRANSFORMER_CLS.from_pretrained(
+    #             model_name_or_path, **kwargs, config=config,
+    #             torch_dtype=torch.bfloat16,
+    #             trust_remote_code=True)
+
+    #     # Building the model on top of the base
+    #     if model_args.lora:
+    #         print_master(f'Loading LoRA from {model_name_or_path}')
+    #         lora_config = LoraConfig.from_pretrained(model_name_or_path)
+    #         lora_model = PeftModel.from_pretrained(base_model, model_name_or_path, config=lora_config, is_trainable=is_trainable)
+    #         lora_model.load_adapter(model_name_or_path, lora_model.active_adapter, is_trainable=is_trainable)
+    #         if not is_trainable:
+    #             lora_model = lora_model.merge_and_unload()
+    #         model = cls(
+    #             encoder=lora_model,
+    #             pooling=model_args.pooling,
+    #             normalize=model_args.normalize,
+    #             temperature=model_args.temperature
+    #         )
+    #     else:
+    #         model = cls(
+    #             encoder=base_model,
+    #             pooling=model_args.pooling,
+    #             normalize=model_args.normalize,
+    #             temperature=model_args.temperature
+    #         )
+
+    #     model.model_backbone = model_args.model_backbone
+    #     return model
 
     def save(self, output_dir: str):
         self.encoder.save_pretrained(output_dir)

@@ -383,6 +383,7 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
 
     if is_main_process:
         print("Building model...")
+        
     model = MMEBModel.build(model_args)
 
     # 应用 LoRA（推荐在 move-to-device 之前或之后依据 peft 版本；这里按你之前逻辑保留）
@@ -401,6 +402,22 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
             total_params = sum(p.numel() for p in model.parameters())
             print("✅ LoRA applied")
             print(f"📊 Trainable params: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+
+    if training_args.gradient_checkpointing:
+
+        # 1. Disable KV cache
+        if hasattr(model.encoder, "config"):
+            model.encoder.config.use_cache = False
+
+        # 2. Enable gradient checkpointing
+        if hasattr(model.encoder, "gradient_checkpointing_enable"):
+            model.encoder.gradient_checkpointing_enable()
+
+        # 3. Required by HF for attention checkpointing
+        if hasattr(model.encoder, "enable_input_require_grads"):
+            model.encoder.enable_input_require_grads()
+
+        print("🔥 Gradient checkpointing ENABLED for encoder:", model.encoder.__class__.__name__)
 
     # Move model to device
     model = model.to(device)
