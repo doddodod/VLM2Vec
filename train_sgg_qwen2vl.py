@@ -22,6 +22,7 @@ import numpy as np
 from tqdm import tqdm
 
 import wandb
+import lora
 
 
 # ------------------------------
@@ -57,6 +58,134 @@ def format_bbox_as_special_token(bbox, normalize=True, original_width=1024, orig
 def format_object_with_ref(object_label):
     """将物体标签包装在对象引用token中"""
     return f"<|object_ref_start|>{object_label}<|object_ref_end|>"
+
+
+def enable_gc_for_encoder(encoder, _seen=None):
+    if _seen is None:
+        _seen = set()
+
+    unwrapped = try_unwrap_peft(encoder)
+
+    uid = id(unwrapped)
+    if uid in _seen:
+        return
+    _seen.add(uid)
+
+    # Skip LoRA leaf modules
+    if "lora" in unwrapped.__class__.__name__.lower():
+        return
+
+    # Disable KV cache
+    if hasattr(unwrapped, "config"):
+        try:
+            unwrapped.config.use_cache = False
+        except Exception:
+            pass
+
+    # Enable checkpointing
+    if hasattr(unwrapped, "gradient_checkpointing_enable"):
+        try:
+            unwrapped.gradient_checkpointing_enable()
+            print(f"🔥 gradient_checkpointing_enable() applied on {unwrapped.__class__.__name__}")
+        except Exception as e:
+            print(f"⚠ Failed to apply gradient_checkpointing_enable() on {type(unwrapped).__name__}: {e}")
+
+    if hasattr(unwrapped, "enable_input_require_grads"):
+        try:
+            unwrapped.enable_input_require_grads()
+            print(f"🔥 enable_input_require_grads() applied on {unwrapped.__class__.__name__}")
+        except Exception as e:
+            print(f"⚠ Failed to apply enable_input_require_grads() on {type(unwrapped).__name__}: {e}")
+
+    # Recurse into backbone submodules
+    for name in ["model", "transformer", "language_model", "vision_model", "vision_tower"]:
+        if hasattr(unwrapped, name):
+            sub = getattr(unwrapped, name)
+            print(f"➡ enabling GC for submodule: {type(unwrapped).__name__}.{name}")
+            enable_gc_for_encoder(sub, _seen=_seen)
+
+# ---------- 安全检查并报告 encoder 各子模块的 gradient_checkpointing 状态 ----------
+def safe_get_submodule(root, path):
+    """按 path（'a.b.c'）安全地遍历属性，任意一步失败返回 None。"""
+    cur = root
+    for part in path.split('.'):
+        try:
+            cur = getattr(cur, part)
+        except Exception:
+            return None
+    return cur
+
+def try_unwrap_peft(m):
+    """如果是 PEFT wrapper，尽量拿到 base model；否则返回原对象。"""
+    # PeftModel 可能把真实模型放在 base_model 或 model 或 underlying_model
+    for attr in ("base_model", "model", "_wrapped_model"):
+        if hasattr(m, attr):
+            try:
+                inner = getattr(m, attr)
+                if inner is not None:
+                    return inner
+            except Exception:
+                pass
+    return m
+
+def report_gradient_checkpointing(encoder):
+    enc = try_unwrap_peft(encoder)
+    print(f"→ Reporting gradient_checkpointing for top encoder type: {type(enc).__name__}")
+
+    # 常见的候选路径（按 Qwen2-VL 及类似模型结构列）
+    candidate_paths = [
+        "",  # top-level encoder itself
+        "model",
+        "model.vision_tower",
+        "model.vision_tower.model",
+        "model.layers",
+        "model.layers.0",
+        "model.layers.0.self_attn",
+        "model.norm",
+        "vision_tower",
+        "language_model",
+        "transformer",
+    ]
+
+    seen = set()
+    for p in candidate_paths:
+        target = enc if p == "" else safe_get_submodule(enc, p)
+        if target is None:
+            continue
+        tname = p if p != "" else "<encoder>"
+        # 避免重复打印同一对象
+        obj_id = id(target)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        # safe read gradient_checkpointing attribute
+        gc_val = None
+        try:
+            gc_val = getattr(target, "gradient_checkpointing", None)
+        except Exception:
+            gc_val = None
+        print(f"{tname:30} | type={type(target).__name__:30} | gradient_checkpointing={gc_val}")
+
+    # 最后，扫描 encoder.named_modules 中有该属性的模块（更全面）
+    try:
+        count = 0
+        for name, sub in enc.named_modules():
+            # 过滤非常短的子模块名让输出可控
+            if len(name) == 0 or name.count('.') > 3:
+                continue
+            if hasattr(sub, "gradient_checkpointing"):
+                try:
+                    val = getattr(sub, "gradient_checkpointing")
+                except Exception:
+                    val = None
+                print(f"named_module: {name:40} | {type(sub).__name__:30} | gradient_checkpointing={val}")
+                count += 1
+                if count >= 30:
+                    break
+        if count == 0:
+            print("No named submodules with explicit `gradient_checkpointing` attribute found in a quick scan.")
+    except Exception as e:
+        print("Warning: scanning named_modules failed:", e)
 
 
 # image token placeholder
@@ -386,40 +515,27 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
         
     model = MMEBModel.build(model_args)
 
-    # 应用 LoRA（推荐在 move-to-device 之前或之后依据 peft 版本；这里按你之前逻辑保留）
-    if getattr(model_args, "lora", False):
-        lora_config = LoraConfig(
-            r=model_args.lora_r,
-            lora_alpha=model_args.lora_alpha,
-            target_modules=model_args.lora_target_modules.split(",") if getattr(model_args, "lora_target_modules", None) else None,
-            lora_dropout=getattr(model_args, "lora_dropout", 0.0),
-            bias="none",
-            task_type="SEQ_2_SEQ_LM",
-        )
-        model.encoder = get_peft_model(model.encoder, lora_config)
-        if is_main_process:
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in model.parameters())
-            print("✅ LoRA applied")
-            print(f"📊 Trainable params: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
-
     if training_args.gradient_checkpointing:
+        print("\n============================")
+        print("🔥 Enabling REAL gradient checkpointing...")
+        print("============================\n")
 
-        # 1. Disable KV cache
-        if hasattr(model.encoder, "config"):
-            model.encoder.config.use_cache = False
+        # 你真正的模型在 model.encoder 里
+        enable_gc_for_encoder(model.encoder)
 
-        # 2. Enable gradient checkpointing
-        if hasattr(model.encoder, "gradient_checkpointing_enable"):
-            model.encoder.gradient_checkpointing_enable()
+        print("\n============================")
+        print("🔥 Gradient checkpointing ENABLED")
+        print("============================\n")
 
-        # 3. Required by HF for attention checkpointing
-        if hasattr(model.encoder, "enable_input_require_grads"):
-            model.encoder.enable_input_require_grads()
-
-        print("🔥 Gradient checkpointing ENABLED for encoder:", model.encoder.__class__.__name__)
 
     # Move model to device
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(model)
+        try:
+            report_gradient_checkpointing(model.encoder)
+        except Exception as e:
+            print("report_gradient_checkpointing raised exception:", e)
+    
     model = model.to(device)
     model.train()
 
@@ -436,6 +552,24 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
         )
     elif torch.cuda.device_count() > 1 and torch.cuda.is_available():
         model = nn.DataParallel(model)
+
+    # If using DDP + gradient checkpointing, it's often necessary to set a static
+    # graph to avoid multiple reentrant backward passes for the same parameters.
+    # We call _set_static_graph() on the underlying module if available.
+    try:
+        if dist_initialized and getattr(training_args, 'gradient_checkpointing', False):
+            base_mod = model.module if hasattr(model, 'module') else model
+            base_mod = try_unwrap_peft(base_mod)
+            if hasattr(base_mod, '_set_static_graph'):
+                try:
+                    base_mod._set_static_graph()
+                    if is_main_process:
+                        print("🔒 Set static graph on base module to avoid DDP reentrant backward issues")
+                except Exception as e:
+                    if is_main_process:
+                        print(f"⚠️ _set_static_graph() failed: {e}")
+    except Exception:
+        pass
 
     # Initialize W&B only on main process to avoid duplicate logs
     if is_main_process and getattr(training_args, "use_wandb", True):
