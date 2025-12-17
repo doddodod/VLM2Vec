@@ -35,7 +35,7 @@ class DataArguments:
         default='/public/home/wangby2025/plusLab/data/vg/test_sampled_ratio.json', 
         metadata={"help": "JSON evaluation dataset path. Default is test_sampled_ratio.json"}
     )
-    num_negatives: int = field(default=5, metadata={"help": "number of negative samples per query"})
+    num_negatives: int = field(default=0, metadata={"help": "number of negative samples per query"})
     dataset_config: str = field(default=None, metadata={"help": "yaml file with dataset configuration"})
     data_basedir: str = field(default=None, metadata={"help": "Expect an absolute path to the base directory of all datasets. If set, it will be prepended to each dataset path"})
     dataset_name: str = field(default=None, metadata={"help": "huggingface dataset name"})

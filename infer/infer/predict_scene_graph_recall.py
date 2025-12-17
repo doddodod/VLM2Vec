@@ -92,7 +92,7 @@ from src.model.processor import load_processor, QWEN2_VL, VLM_IMAGE_TOKENS
 
 
 INPUT_FILE = "/public/home/wangby2025/plusLab/VLM2Vec/infer/test_2000_images.json"
-OUTPUT_FILE = "/public/home/wangby2025/plusLab/outputs/test_2000_recall/one_card_balanced.json"
+OUTPUT_FILE = "/public/home/wangby2025/plusLab/outputs/test_2000_recall/four_card_37k.json"
 
 # 默认使用的GPU数量（None表示使用所有可用GPU）
 # 也可以通过命令行参数 --num_gpus 或环境变量 NUM_GPUS 指定
@@ -706,7 +706,7 @@ def main():
         model_name='/public/home/wangby2025/plusLab/VLM2Vec/model/Qwen/Qwen2-VL-2B-Instruct',
         # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/qwen_vl/Qwen2-VL-2B-Instruct',
         # checkpoint_path='/public/home/xiaojw2025/Workspace/VLM2Vec/models/VLM2Vec-Qwen2VL-2B',
-        checkpoint_path='/public/home/wangby2025/plusLab/outputs/sgg_qwen2vl_balanced/best_model_eval',
+        checkpoint_path='/public/home/wangby2025/plusLab/outputs/sgg_qwen2vl_4_card_no_neg_37k/best_model_eval',
         pooling='last',
         normalize=True,
         model_backbone='qwen2_vl',

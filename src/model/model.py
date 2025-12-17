@@ -491,18 +491,17 @@ class MMEBModel(nn.Module):
 
     #     return loss
     def forward(self, qry=None, tgt=None, neg=None, *args, **kwargs):
-        """
-        qry: query inputs (text+image)
-        tgt: positive target inputs (text)
-        neg: explicit negative inputs (text)
-        """
         qry_reps = self.encode_input(qry) if qry else None
         tgt_reps = self.encode_input(tgt) if tgt else None
-        neg_reps = self.encode_input(neg) if neg else None
-
+        
+        if neg is not None and len(neg.get('text', [])) > 0:
+            neg_reps = self.encode_input(neg)
+        else:
+            neg_reps = None
+        
         if qry_reps is None or tgt_reps is None:
             return {"qry_reps": qry_reps, "tgt_reps": tgt_reps, "neg_reps": neg_reps}
-
+        
         # DDP gather
         if self.is_ddp:
             all_qry_reps = self._dist_gather_tensor(qry_reps)
@@ -512,33 +511,29 @@ class MMEBModel(nn.Module):
             all_qry_reps = qry_reps
             all_tgt_reps = tgt_reps
             all_neg_reps = neg_reps
-
+        
         batch_size = all_qry_reps.size(0)
-
-        # ===== Positive scores =====
-        pos_scores = self.compute_similarity(all_qry_reps, all_tgt_reps)  # [B, 1]
-
-        # ===== Explicit negative scores =====
+        
+        # ===== In-batch negatives: Q @ T^T =====
+        scores = self.compute_similarity(all_qry_reps, all_tgt_reps)  # [B, B]
+        
+        # ===== Add explicit negatives if present =====
         if all_neg_reps is not None:
             neg_scores = self.compute_similarity(all_qry_reps, all_neg_reps)  # [B, N]
-            scores = torch.cat([pos_scores, neg_scores], dim=1)  # [B, 1+N]
-        else:
-            scores = pos_scores  # [B, 1]
-
-        # ===== In-batch negative scores =====
-        if batch_size > 1:
-            batch_sim = self.compute_similarity(all_qry_reps, all_tgt_reps)  # [B, B]
-            mask = torch.eye(batch_size, dtype=torch.bool, device=batch_sim.device)
-            batch_neg_scores = batch_sim.masked_select(~mask).view(batch_size, -1)  # [B, B-1]
-            scores = torch.cat([scores, batch_neg_scores], dim=1)  # [B, 1+N+(B-1)]
-
-        # ===== Cross-entropy loss =====
-        target = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
+            scores = torch.cat([scores, neg_scores], dim=1)  # [B, B+N]
+        
+        # ===== Target indices =====
+        # For in-batch: positive for query i is at column i
+        # Format: [B, B+N] where columns are [tgt_0, tgt_1, ..., tgt_{B-1}, neg_0, ..., neg_{N-1}]
+        target = torch.arange(batch_size, device=scores.device, dtype=torch.long)  # [0,1,2,...,B-1]
+        
+        # ===== Loss =====
         loss = self.cross_entropy(scores / self.temperature, target)
-
-        if self.is_ddp:
-            loss = loss * self.world_size
-
+        
+        # REMOVE THIS - causes inflated loss
+        # if self.is_ddp:
+        #     loss = loss * self.world_size
+        
         return {"loss": loss, "scores": scores}
 
 
@@ -551,4 +546,6 @@ class MMEBModel(nn.Module):
         return all_tensors
 
     def compute_similarity(self, q_reps, p_reps):
+        q_norm = torch.nn.functional.normalize(q_reps, dim=-1)
+        p_norm = torch.nn.functional.normalize(p_reps, dim=-1)
         return torch.matmul(q_reps, p_reps.transpose(0, 1))

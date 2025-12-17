@@ -206,6 +206,7 @@ class MultimodalDataCollator:
 
     #     # print_rank(f"\t\tQry collator: processed_qry_inputs['input_ids'].shape={processed_qry_inputs['input_ids'].shape}\t\tPos collator: processed_pos_inputs['input_ids'].shape={processed_pos_inputs['input_ids'].shape}")
     #     return processed_qry_inputs, processed_pos_inputs
+    
     def __call__(self, examples):
         """
         Collator for VLM2Vec + contrastive SGG training.
@@ -214,51 +215,50 @@ class MultimodalDataCollator:
                         'query_text', 'query_image', 'pos_text', 'neg_text' (list)
         :return: processed_qry_inputs, processed_pos_inputs, processed_neg_inputs
         """
-        # ----------------------
         # Step 1: Load query inputs (text + image)
-        # ----------------------
         qry_inputs = self._get_batch_inputs(examples, "query_text", "query_image")  # dict: 'text', 'images'
 
-        # ----------------------
         # Step 2: Load raw positive and negative texts
-        # ----------------------
-        pos_texts = [e['pos_text'] for e in examples]       # one positive per query
-        neg_texts_list = [e['neg_text'] for e in examples]  # list of lists
+        pos_texts = [e['pos_text'] for e in examples]
+        neg_texts_list = [e['neg_text'] for e in examples]
 
-        # ----------------------
         # Step 3: Prepare processor inputs
-        # ----------------------
-        # Positives: only text
         pos_inputs_for_processor = {
             'text': pos_texts,
-            'images': [None] * len(pos_texts)  # positives have no images
+            'images': [None] * len(pos_texts)
         }
 
-        # Negatives: flatten list
+        # Flatten negative texts
         neg_combined_texts = [n for neg_list in neg_texts_list for n in neg_list]
-        neg_inputs_for_processor = {
-            'text': neg_combined_texts,
-            'images': [None] * len(neg_combined_texts)  # negatives have no images
-        }
+        if neg_combined_texts:
+            neg_inputs_for_processor = {
+                'text': neg_combined_texts,
+                'images': [None] * len(neg_combined_texts)
+            }
+        else:
+            neg_inputs_for_processor = None  # mark empty negatives
 
-        # ----------------------
         # Step 4: Process all inputs
-        # ----------------------
         process_fn = process_vlm_inputs_fns[self.model_args.model_backbone]
 
         processed_qry_inputs = process_fn(qry_inputs, processor=self.processor, max_length=self.data_args.max_len)
         processed_pos_inputs = process_fn(pos_inputs_for_processor, processor=self.processor, max_length=self.data_args.max_len)
-        processed_neg_inputs = process_fn(neg_inputs_for_processor, processor=self.processor, max_length=self.data_args.max_len)
 
-        # ----------------------
+        if neg_inputs_for_processor is not None:
+            processed_neg_inputs = process_fn(neg_inputs_for_processor, processor=self.processor, max_length=self.data_args.max_len)
+        else:
+            processed_neg_inputs = None  # forward will handle None safely
+
         # Step 5: Metadata
-        # ----------------------
         processed_qry_inputs['text'] = qry_inputs['text']
         processed_pos_inputs['text'] = pos_texts
-        processed_neg_inputs['text'] = neg_combined_texts
+        processed_neg_inputs_text = neg_combined_texts if neg_combined_texts else []
+        if processed_neg_inputs is not None:
+            processed_neg_inputs['text'] = processed_neg_inputs_text
 
         processed_qry_inputs['global_dataset_name'] = [e['global_dataset_name'] for e in examples]
         processed_pos_inputs['global_dataset_name'] = [e['global_dataset_name'] for e in examples]
-        processed_neg_inputs['global_dataset_name'] = [e['global_dataset_name'] for e in examples]
+        if processed_neg_inputs is not None:
+            processed_neg_inputs['global_dataset_name'] = [e['global_dataset_name'] for e in examples]
 
         return processed_qry_inputs, processed_pos_inputs, processed_neg_inputs

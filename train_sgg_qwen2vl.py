@@ -20,6 +20,7 @@ from PIL import Image
 
 import numpy as np
 from tqdm import tqdm
+from datetime import datetime
 
 import wandb
 import lora
@@ -186,6 +187,48 @@ def report_gradient_checkpointing(encoder):
             print("No named submodules with explicit `gradient_checkpointing` attribute found in a quick scan.")
     except Exception as e:
         print("Warning: scanning named_modules failed:", e)
+
+
+def debug_batch(batch_tuple, model, global_step):
+    qry_inputs, pos_inputs, neg_inputs = batch_tuple
+
+    # If model is wrapped in DP/DDP, access the underlying module
+    real_model = model.module if hasattr(model, 'module') else model
+
+    def shape_str(x):
+        try:
+            return x['input_ids'].shape
+        except Exception:
+            return None
+
+    print("--- DEBUG BATCH --- step", global_step)
+    print("qry_text_len:", len(qry_inputs.get('text', [])))
+    print("pos input_ids shape:", shape_str(pos_inputs))
+
+    if neg_inputs is None or len(neg_inputs.get('text', [])) == 0:
+        print("neg_inputs: None or empty")
+    else:
+        print("neg input_ids shape:", shape_str(neg_inputs))
+        print("neg text length:", len(neg_inputs.get('text', [])))
+
+    # after encoding
+    with torch.no_grad():
+        q_emb = real_model.encode_input(qry_inputs) if qry_inputs else None
+        p_emb = real_model.encode_input(pos_inputs) if pos_inputs else None
+        n_emb = real_model.encode_input(neg_inputs) if neg_inputs and len(neg_inputs.get('text', [])) > 0 else None
+
+    print("q_emb:", None if q_emb is None else getattr(q_emb, 'shape', q_emb.size()))
+    print("p_emb:", None if p_emb is None else getattr(p_emb, 'shape', p_emb.size()))
+    print("n_emb:", None if n_emb is None else getattr(n_emb, 'shape', n_emb.size()))
+
+    # optional: similarity shapes
+    if q_emb is not None and p_emb is not None:
+        sim = real_model.compute_similarity(q_emb, p_emb)
+        print("sim shape:", sim.shape)
+
+    print("--- END DEBUG ---")
+
+
 
 
 # image token placeholder
@@ -832,6 +875,14 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
             wandb.log({"train/epoch_loss": avg_epoch_loss, "epoch": epoch+1}, step=global_step)
         if is_main_process:
             print(f"📊 Epoch {epoch+1} Avg Loss: {avg_epoch_loss:.4f} [W&B logged]\n")
+
+            # Print/log current time at the end of each epoch
+            try:
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"⏱️  Epoch {epoch+1} finished at: {now}")
+            except Exception:
+                # Fail-safe: do not crash training if timestamp logging fails
+                print("⚠️  Failed to log epoch timestamp")
 
         # epoch 末尾 evaluate
         if val_loader is not None:
