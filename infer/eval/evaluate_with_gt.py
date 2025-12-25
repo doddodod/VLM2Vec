@@ -833,10 +833,10 @@ def main():
 # OUTPUT_FILE = "/public/home/xiaojw2025/Data/embedding_similarity/vlm2vec_qwen2vl/result_recall_20_all.json"
 
     parser.add_argument('--json_file', type=str, 
-                       default='/public/home/wangby2025/plusLab/outputs/test_2000_recall/four_card_37k.json',
+                       default='/public/home/wangby2025/plusLab/outputs/test_2000_recall/best_eval_simi_37k_base.json',
                        help='预测结果JSON文件路径')
     parser.add_argument('--gt_file', type=str,
-                       default='/public/home/wangby2025/plusLab/VLM2Vec/infer/test_2000_clean.json',
+                       default='/public/home/wangby2025/plusLab/VLM2Vec/infer/test_2000_images.json',
                        help='GT文件路径')
     parser.add_argument('--k-values', type=int, nargs='+', default=[50, 100],
                        help='指定要计算的K值列表（默认: 50 100）')

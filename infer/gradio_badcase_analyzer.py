@@ -503,7 +503,7 @@ with gr.Blocks(title="Bad Case 分析器") as demo:
             result_file_input = gr.Textbox(
                 label="预测结果文件路径",
                 placeholder="例如: /public/home/xiaojw2025/Data/embedding_similarity/vlm2vec_qwen2vl/result_recall_2000_filter_original.json",
-                value="/public/home/wangby2025/plusLab/outputs/test_2000_recall/four_card_37k.json"
+                value="/public/home/wangby2025/plusLab/outputs/test_2000_recall/four_card_train_74k.json"
             )
             gt_file_input = gr.Textbox(
                 label="GT文件路径（可选）",

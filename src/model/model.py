@@ -548,4 +548,4 @@ class MMEBModel(nn.Module):
     def compute_similarity(self, q_reps, p_reps):
         q_norm = torch.nn.functional.normalize(q_reps, dim=-1)
         p_norm = torch.nn.functional.normalize(p_reps, dim=-1)
-        return torch.matmul(q_reps, p_reps.transpose(0, 1))
+        return torch.matmul(q_norm,p_norm.transpose(0, 1))

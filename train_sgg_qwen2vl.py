@@ -24,6 +24,7 @@ from datetime import datetime
 
 import wandb
 import lora
+import gc
 
 
 # ------------------------------
@@ -394,6 +395,12 @@ def evaluate(model, val_loader, device, is_distributed=False, return_scores=Fals
     """
     model_to_eval = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
     model_to_eval.eval()
+
+    # 🔴 重要：评估前清理（防止从训练带来的内存碎片）
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # 确保所有操作完成
+    gc.collect()
     
     all_losses = []
     last_scores = None
@@ -436,7 +443,19 @@ def evaluate(model, val_loader, device, is_distributed=False, return_scores=Fals
     else:
         mean_loss = float(local_mean_loss.item())
 
+    # 🔴 清理中间变量
+    del all_losses, local_losses_tensor, loss_tensor
+    if last_scores is not None and not return_scores:
+        del last_scores
+        last_scores = None
+
     model_to_eval.train()
+
+    # 评估后清理
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
     
     if return_scores:
         return mean_loss, last_scores
@@ -772,6 +791,13 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
 
     # --- main training loop ---
     for epoch in range(int(training_args.num_train_epochs)):
+        # 🟢 每个epoch开始时清理（预防性）
+        if epoch > 0:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            gc.collect()
+
         model.train()
         epoch_losses = []
         optimizer.zero_grad()
@@ -883,6 +909,12 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
             except Exception:
                 # Fail-safe: do not crash training if timestamp logging fails
                 print("⚠️  Failed to log epoch timestamp")
+        
+        # 🟢 Epoch 结束清理（顺序正确）
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # epoch 末尾 evaluate
         if val_loader is not None:
@@ -891,7 +923,8 @@ def train_loop(model_args: ModelArguments, data_args: DataArguments, training_ar
                 wandb.log({"eval/epoch_loss": val_loss_epoch, "epoch": epoch+1}, step=global_step)
             if is_main_process:
                 print(f"📊 Epoch {epoch+1} Validation Loss: {val_loss_epoch:.4f} [W&B logged]")
-
+            torch.cuda.empty_cache()
+            gc.collect()
          # ===== 保存 checkpoint（修复 save_steps 逻辑）=====
         save_steps = getattr(training_args, "save_steps", None)
         should_save_ckpt = False
